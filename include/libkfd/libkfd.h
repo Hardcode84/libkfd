@@ -15,6 +15,7 @@
 #include "libkfd/dispatch.h"
 #include "libkfd/error.h"
 #include "libkfd/event.h"
+#include "libkfd/gpu.h"
 #include "libkfd/loader.h"
 #include "libkfd/memory.h"
 #include "libkfd/queue.h"

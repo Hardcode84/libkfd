@@ -1,6 +1,7 @@
 target_sources(kfd PRIVATE
   device.cpp
   event.cpp
+  gpu.cpp
   context.cpp
   loader.cpp
   memory.cpp
