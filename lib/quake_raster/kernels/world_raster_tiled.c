@@ -84,6 +84,12 @@ static float qr_edge(float ax, float ay, float bx, float by, float px, float py)
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
 }
 
+static int qr_finite(float value)
+{
+  return value == value && value <= 3.402823466e38f &&
+         value >= -3.402823466e38f;
+}
+
 static unsigned qr_clamp_coord(float value, unsigned limit)
 {
   int coord;
@@ -195,6 +201,13 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   unsigned char light;
   unsigned char color;
 
+  if (!qr_finite(triangle->v0.x) || !qr_finite(triangle->v0.y) ||
+      !qr_finite(triangle->v0.z) || !qr_finite(triangle->v1.x) ||
+      !qr_finite(triangle->v1.y) || !qr_finite(triangle->v1.z) ||
+      !qr_finite(triangle->v2.x) || !qr_finite(triangle->v2.y) ||
+      !qr_finite(triangle->v2.z) || !qr_finite(area)) {
+    return;
+  }
   if (area > -0.00001f && area < 0.00001f) {
     return;
   }
@@ -204,7 +217,8 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   w1 = qr_edge(triangle->v2.x, triangle->v2.y, triangle->v0.x,
                triangle->v0.y, px, py) / area;
   w2 = 1.0f - w0 - w1;
-  if (w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f) {
+  if (!qr_finite(w0) || !qr_finite(w1) || !qr_finite(w2) ||
+      w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f) {
     return;
   }
 
@@ -216,10 +230,13 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   inv_z1 = 1.0f / triangle->v1.z;
   inv_z2 = 1.0f / triangle->v2.z;
   inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
-  if (inv_z <= 0.0f) {
+  if (!qr_finite(inv_z) || inv_z <= 0.0f) {
     return;
   }
   depth = 1.0f / inv_z;
+  if (!qr_finite(depth)) {
+    return;
+  }
   depth_key = qr_depth_key(depth);
   if (*best_depth < 3.402823466e38f) {
     if (depth > *best_depth - QR_DEPTH_TIE_EPSILON) {

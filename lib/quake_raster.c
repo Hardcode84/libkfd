@@ -1668,6 +1668,7 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
 {
   qr_tile_bin_args *bin_args;
   qr_world_raster_args *args;
+  uint32_t preserve_depth;
   uint64_t start_ns;
   uint64_t end_ns;
   int err;
@@ -1711,7 +1712,8 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   args->triangle_count = (uint32_t)triangle_count;
   args->debug_mode = (uint32_t)debug_mode;
   args->time_seconds = time_seconds;
-  args->preserve_depth = ctx->frame_depth_valid != 0 ? 1U : 0U;
+  preserve_depth = ctx->frame_depth_valid != 0 ? 1U : 0U;
+  args->preserve_depth = preserve_depth;
 
   bin_args = (qr_tile_bin_args *)kfd_gpu_buffer_cpu(ctx->tile_bin_root);
   if (bin_args == NULL) {
@@ -1722,25 +1724,53 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   bin_args->triangle_count = (uint32_t)triangle_count;
 
   start_ns = qr_now_ns();
-  err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
-                         &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
-                         ctx->tile_bin_fence);
-  if (err == 0) {
-    err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
-  }
-  if (err != 0) {
-    return qr_result_from_gpu_error(err);
+  if (preserve_depth != 0U) {
+    uint32_t *counts = (uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_counts);
+    uint32_t *overflows = (uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_overflows);
+    uint32_t *depth_min = (uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_depth_min);
+    uint32_t *depth_max = (uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_depth_max);
+
+    if (counts == NULL || overflows == NULL || depth_min == NULL ||
+        depth_max == NULL) {
+      return QR_ERROR_IO;
+    }
+    for (uint32_t i = 0U; i < ctx->tile_count; ++i) {
+      counts[i] = 0U;
+      overflows[i] = 1U;
+      depth_min[i] = 0U;
+      depth_max[i] = UINT32_MAX;
+    }
+    qr_reset_raster_stats(ctx);
+    ctx->last_stats.triangle_count = (uint32_t)triangle_count;
+    ctx->last_stats.occupied_tile_count = ctx->tile_count;
+    ctx->last_stats.overflow_tile_count = ctx->tile_count;
+    if (triangle_count > UINT32_MAX / ctx->tile_count) {
+      ctx->last_stats.hiz_overflow_fallback_count = UINT32_MAX;
+    } else {
+      ctx->last_stats.hiz_overflow_fallback_count =
+          (uint32_t)triangle_count * ctx->tile_count;
+    }
+  } else {
+    err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
+                           &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
+                           ctx->tile_bin_fence);
+    if (err == 0) {
+      err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
+    }
+    if (err != 0) {
+      return qr_result_from_gpu_error(err);
+    }
+    {
+      qr_result stats_result =
+          qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
+      if (stats_result != QR_SUCCESS) {
+        return stats_result;
+      }
+    }
   }
   end_ns = qr_now_ns();
   if (end_ns >= start_ns) {
     ctx->perf.tile_bin_time_ns += end_ns - start_ns;
-  }
-  {
-    qr_result stats_result =
-        qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
-    if (stats_result != QR_SUCCESS) {
-      return stats_result;
-    }
   }
 
   start_ns = qr_now_ns();
