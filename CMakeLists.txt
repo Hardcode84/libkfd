@@ -117,6 +117,33 @@ target_compile_options(kfd PRIVATE
   "$<$<COMPILE_LANGUAGE:CXX>:-Wp,-U_LIBCPP_ENABLE_ASSERTIONS>"
 )
 
+add_library(quake_raster STATIC)
+add_library(libkfd::quake_raster ALIAS quake_raster)
+target_sources(quake_raster PRIVATE lib/quake_raster.c)
+target_include_directories(quake_raster PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_compile_features(quake_raster PUBLIC c_std_99)
+set_target_properties(quake_raster PROPERTIES
+  C_STANDARD 99
+  C_STANDARD_REQUIRED ON
+  C_EXTENSIONS OFF
+)
+target_compile_options(quake_raster PRIVATE
+  -Wall
+  -Wextra
+  -Wpedantic
+  -Werror
+  -Wconversion
+  -Wsign-conversion
+  -Wshadow
+  -Wformat=2
+  -Wstrict-prototypes
+  -Wmissing-prototypes
+)
+target_link_libraries(quake_raster PUBLIC kfd)
+
 add_subdirectory(lib)
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -128,7 +155,7 @@ if(LIBKFD_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-install(TARGETS kfd
+install(TARGETS kfd quake_raster
   EXPORT libkfdTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
