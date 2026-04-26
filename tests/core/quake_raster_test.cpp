@@ -55,6 +55,8 @@ TEST_CASE("Quake raster - exposes API version and error strings",
   CHECK(qr_strerror(QR_ERROR_INVALID_ARGUMENT) != nullptr);
   CHECK(qr_strerror(QR_ERROR_BUFFER_TOO_SMALL) != nullptr);
   CHECK(qr_strerror(QR_ERROR_GPU) != nullptr);
+  CHECK(qr_pack_depth_payload(0x12345678U, 0x90abcdefU) ==
+        0x1234567890abcdefULL);
 }
 
 TEST_CASE("Quake raster - rejects invalid descriptors", "[quake_raster]") {
@@ -520,6 +522,10 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
     CHECK(stats.max_tile_triangle_count == 4);
     CHECK(stats.overflow_tile_count == 0);
     CHECK(stats.overflow_reference_count == 0);
+    CHECK(stats.depth_key_scale == QR_DEPTH_KEY_SCALE);
+    CHECK(stats.depth_bound_tile_count == 1);
+    CHECK(stats.hiz_candidate_reference_count == 4);
+    CHECK(stats.hiz_overflow_fallback_count == 0);
   }
 
   render_mode(QR_DEBUG_FLAT_SURFACE_ID);
@@ -562,6 +568,99 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
     CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
     REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
   }
+
+  qr_destroy(ctx);
+}
+
+TEST_CASE("Quake raster - depth order validation flags fixed-key ties",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 16;
+  constexpr std::uint32_t HEIGHT = 16;
+  const std::array<std::uint8_t, 4> texture{1, 1, 1, 1};
+  const std::array<std::uint8_t, 4> lightmap{1, 1, 1, 1};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .texture_atlas_bytes = texture.size(),
+      .lightmap_atlas_bytes = lightmap.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc tex_desc{
+      .mips =
+          {
+              {.pixels = texture.data(), .width = 2, .height = 2, .stride = 2},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = lightmap.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  qr_world_surface_desc surface{};
+  const std::array<qr_world_vertex, 4> farther{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.10020F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 0.0F, .z = 0.10020F, .u = 2.0F, .v = 0.0F,
+       .light_u = 2.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 16.0F, .z = 0.10020F, .u = 2.0F, .v = 2.0F,
+       .light_u = 2.0F, .light_v = 2.0F},
+      {.x = 0.0F, .y = 16.0F, .z = 0.10020F, .u = 0.0F, .v = 2.0F,
+       .light_u = 0.0F, .light_v = 2.0F},
+  }};
+  const std::array<qr_world_vertex, 4> nearer{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.10010F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 0.0F, .z = 0.10010F, .u = 2.0F, .v = 0.0F,
+       .light_u = 2.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 16.0F, .z = 0.10010F, .u = 2.0F, .v = 2.0F,
+       .light_u = 2.0F, .light_v = 2.0F},
+      {.x = 0.0F, .y = 16.0F, .z = 0.10010F, .u = 0.0F, .v = 2.0F,
+       .light_u = 0.0F, .light_v = 2.0F},
+  }};
+  std::array<qr_world_polygon_desc, 2> polygons{{
+      {.surface = 0, .vertices = farther.data(),
+       .vertex_count = static_cast<std::uint32_t>(farther.size())},
+      {.surface = 0, .vertices = nearer.data(),
+       .vertex_count = static_cast<std::uint32_t>(nearer.size())},
+  }};
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+  qr_world_draw_desc draw_desc{
+      .world = QR_INVALID_HANDLE,
+      .polygons = polygons.data(),
+      .polygon_count = polygons.size(),
+      .debug_mode = QR_DEBUG_DEPTH_ORDER,
+  };
+
+  REQUIRE(qr_upload_texture(ctx, &tex_desc, &tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surface.texture = tex;
+  surface.lightmap = lm;
+  REQUIRE(qr_create_world(ctx, &surface, 1, &world) == QR_SUCCESS);
+  draw_desc.world = world;
+
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+  REQUIRE(qr_frame_draw_world(frame, &draw_desc) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+          QR_SUCCESS);
+  CHECK(std::any_of(pixels.begin(), pixels.end(),
+                    [](std::uint8_t pixel) { return pixel == 255; }));
 
   qr_destroy(ctx);
 }

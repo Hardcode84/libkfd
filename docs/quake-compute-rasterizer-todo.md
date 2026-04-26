@@ -119,12 +119,12 @@ Exit criteria:
 
 ## Milestone 7: Depth, Color, And HiZ Policy
 
-- [ ] Choose MVP depth representation: fixed-point or ordered float bits.
-- [ ] Implement opaque-world ordering policy without byte color atomics.
-- [ ] Add validation mode for depth/order disagreements.
-- [ ] Add per-tile depth bounds.
-- [ ] Add early reject using tile depth bounds.
-- [ ] Prototype packed 64-bit atomic depth/payload path for later entities.
+- [x] Choose MVP depth representation: fixed-point or ordered float bits.
+- [x] Implement opaque-world ordering policy without byte color atomics.
+- [x] Add validation mode for depth/order disagreements.
+- [x] Add per-tile depth bounds.
+- [x] Add early reject using tile depth bounds.
+- [x] Prototype packed 64-bit atomic depth/payload path for later entities.
 
 Exit criteria:
 

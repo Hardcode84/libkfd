@@ -1,6 +1,8 @@
 #include "libkfd/gpu/kernel.h"
 
 #define QR_TILE_SIZE 16U
+#define QR_DEPTH_KEY_SCALE 4096U
+#define QR_DEPTH_KEY_MAX 4294967295U
 
 struct QrRasterVertex {
   float x;
@@ -24,6 +26,8 @@ struct QrTileBinArgs {
   unsigned *tile_indices;
   unsigned *tile_counts;
   unsigned *tile_overflows;
+  unsigned *tile_depth_min;
+  unsigned *tile_depth_max;
   unsigned width;
   unsigned height;
   unsigned triangle_count;
@@ -70,6 +74,19 @@ static int qr_triangle_intersects_tile(struct QrRasterTriangle *triangle,
   return 1;
 }
 
+static unsigned qr_depth_key(float depth)
+{
+  float scaled = depth * (float)QR_DEPTH_KEY_SCALE;
+
+  if (scaled <= 0.0f) {
+    return 0U;
+  }
+  if (scaled >= (float)QR_DEPTH_KEY_MAX) {
+    return QR_DEPTH_KEY_MAX;
+  }
+  return (unsigned)scaled;
+}
+
 KFD_GPU_KERNEL void qr_bin_tiles(struct QrTileBinArgs *args)
 {
   unsigned tile = kfd_global_id_x();
@@ -78,6 +95,8 @@ KFD_GPU_KERNEL void qr_bin_tiles(struct QrTileBinArgs *args)
   unsigned tile_y;
   unsigned count = 0U;
   unsigned overflow = 0U;
+  unsigned depth_min = QR_DEPTH_KEY_MAX;
+  unsigned depth_max = 0U;
   unsigned i;
 
   if (tile >= tile_count) {
@@ -91,6 +110,22 @@ KFD_GPU_KERNEL void qr_bin_tiles(struct QrTileBinArgs *args)
                                      args->width, args->height)) {
       continue;
     }
+    {
+      unsigned z0 = qr_depth_key(args->triangles[i].v0.z);
+      unsigned z1 = qr_depth_key(args->triangles[i].v1.z);
+      unsigned z2 = qr_depth_key(args->triangles[i].v2.z);
+      unsigned tri_min = z0 < z1 ? z0 : z1;
+      unsigned tri_max = z0 > z1 ? z0 : z1;
+
+      tri_min = tri_min < z2 ? tri_min : z2;
+      tri_max = tri_max > z2 ? tri_max : z2;
+      if (tri_min < depth_min) {
+        depth_min = tri_min;
+      }
+      if (tri_max > depth_max) {
+        depth_max = tri_max;
+      }
+    }
     if (count < args->tile_triangle_capacity) {
       args->tile_indices[tile * args->tile_triangle_capacity + count] = i;
       ++count;
@@ -100,4 +135,6 @@ KFD_GPU_KERNEL void qr_bin_tiles(struct QrTileBinArgs *args)
   }
   args->tile_counts[tile] = count;
   args->tile_overflows[tile] = overflow;
+  args->tile_depth_min[tile] = depth_min;
+  args->tile_depth_max[tile] = depth_max;
 }

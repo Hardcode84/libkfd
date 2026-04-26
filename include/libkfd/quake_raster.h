@@ -19,13 +19,14 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 3U
+#define QR_API_VERSION_MINOR 4U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
 #define QR_COLORMAP_SIZE (256U * 256U)
 #define QR_TILE_SIZE 16U
 #define QR_TILE_TRIANGLE_CAPACITY 256U
+#define QR_DEPTH_KEY_SCALE 4096U
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -56,7 +57,8 @@ typedef enum qr_debug_mode {
   QR_DEBUG_FLAT_SURFACE_ID,
   QR_DEBUG_DEPTH,
   QR_DEBUG_TEXTURE_ONLY,
-  QR_DEBUG_LIGHT_ONLY
+  QR_DEBUG_LIGHT_ONLY,
+  QR_DEBUG_DEPTH_ORDER
 } qr_debug_mode;
 
 typedef uint32_t qr_texture;
@@ -164,11 +166,16 @@ typedef struct qr_raster_stats {
   uint32_t max_tile_triangle_count;
   uint32_t overflow_tile_count;
   uint32_t overflow_reference_count;
+  uint32_t depth_key_scale;
+  uint32_t depth_bound_tile_count;
+  uint32_t hiz_candidate_reference_count;
+  uint32_t hiz_overflow_fallback_count;
 } qr_raster_stats;
 
 /* Returns QR_API_VERSION_* packed in 8-bit fields as 0x00MMmmPP. */
 uint32_t qr_api_version(void);
 const char *qr_strerror(qr_result code);
+uint64_t qr_pack_depth_payload(uint32_t depth_key, uint32_t payload);
 
 /*
  * Creates a renderer context. The context owns all GPU buffers, loaded kernels,
