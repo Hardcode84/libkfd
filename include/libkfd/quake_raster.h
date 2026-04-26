@@ -93,6 +93,25 @@ typedef qr_result (*qr_present_surface_callback)(
 typedef qr_result (*qr_prepare_present_surface_callback)(
     void *userdata, const qr_present_surface_desc *surface);
 
+typedef struct qr_present_overlay_desc {
+  const uint8_t *top_pixels;
+  const uint8_t *ui_pixels;
+  const uint8_t *sbar_pixels;
+  const uint32_t *top_palette_xrgb;
+  const uint32_t *ui_palette_xrgb;
+  uint32_t top_enabled;
+  uint32_t ui_enabled;
+  uint32_t sbar_enabled;
+  int32_t ui_x;
+  int32_t ui_y;
+  uint32_t ui_w;
+  uint32_t ui_h;
+  int32_t sbar_x;
+  int32_t sbar_y;
+  uint32_t sbar_w;
+  uint32_t sbar_h;
+} qr_present_overlay_desc;
+
 typedef struct qr_desc {
   uint32_t width;
   uint32_t height;
@@ -383,6 +402,8 @@ qr_result qr_read_depth(qr_context *ctx, float *dst, size_t dst_size,
                         size_t dst_stride);
 qr_result qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
                        size_t dst_size, size_t dst_stride_pixels);
+qr_result qr_update_present_overlays(qr_context *ctx,
+                                     const qr_present_overlay_desc *desc);
 
 qr_result qr_dump_indexed(qr_context *ctx, const char *path);
 qr_result qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
