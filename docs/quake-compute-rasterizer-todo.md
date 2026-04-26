@@ -14,10 +14,10 @@ Status: started.
 - [x] Add `QR_OUTPUT_NOOUTPUT`.
 - [x] Add dummy indexed framebuffer clear/readback.
 - [x] Add headless smoke test.
-- [ ] Replace ad hoc `calloc/free` with renderer-owned allocator or arena.
-- [ ] Add public API versioning.
-- [ ] Add structured error enum instead of raw errno-only returns.
-- [ ] Add API docs for ownership, threading, and frame lifetime.
+- [x] Replace ad hoc `calloc/free` with renderer-owned allocation helpers.
+- [x] Add public API versioning.
+- [x] Add structured error enum instead of raw errno-only returns.
+- [x] Add API docs for ownership, threading, and frame lifetime.
 
 Exit criteria:
 

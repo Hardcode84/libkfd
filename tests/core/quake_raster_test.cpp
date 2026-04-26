@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,8 +19,8 @@ namespace {
 
 qr_context *create_context_or_skip(const qr_desc &desc) {
   qr_context *ctx = nullptr;
-  int err = qr_create(&desc, &ctx);
-  if (err != 0) {
+  qr_result err = qr_create(&desc, &ctx);
+  if (err != QR_SUCCESS) {
     SKIP("KFD not available: " << qr_strerror(err) << " ("
                                << kfd_gpu_last_error() << ")");
   }
@@ -45,6 +44,19 @@ std::vector<std::uint8_t> read_binary_file(const std::filesystem::path &path) {
 
 } // namespace
 
+TEST_CASE("Quake raster - exposes API version and error strings",
+          "[quake_raster]") {
+  constexpr std::uint32_t VERSION =
+      (QR_API_VERSION_MAJOR << 16U) | (QR_API_VERSION_MINOR << 8U) |
+      QR_API_VERSION_PATCH;
+
+  CHECK(qr_api_version() == VERSION);
+  CHECK(qr_strerror(QR_SUCCESS) != nullptr);
+  CHECK(qr_strerror(QR_ERROR_INVALID_ARGUMENT) != nullptr);
+  CHECK(qr_strerror(QR_ERROR_BUFFER_TOO_SMALL) != nullptr);
+  CHECK(qr_strerror(QR_ERROR_GPU) != nullptr);
+}
+
 TEST_CASE("Quake raster - rejects invalid descriptors", "[quake_raster]") {
   qr_context *ctx = nullptr;
   constexpr std::uint32_t U32_MAX =
@@ -57,27 +69,27 @@ TEST_CASE("Quake raster - rejects invalid descriptors", "[quake_raster]") {
       .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
   };
 
-  CHECK(qr_create(nullptr, &ctx) != 0);
-  CHECK(qr_create(&desc, nullptr) != 0);
-  CHECK(qr_create(&desc, &ctx) != 0);
+  CHECK(qr_create(nullptr, &ctx) == QR_ERROR_INVALID_ARGUMENT);
+  CHECK(qr_create(&desc, nullptr) == QR_ERROR_INVALID_ARGUMENT);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_INVALID_ARGUMENT);
   CHECK(ctx == nullptr);
 
   desc.width = 16;
   desc.output_mode = QR_OUTPUT_PRESENT;
-  CHECK(qr_create(&desc, &ctx) == ENOTSUP);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_UNSUPPORTED);
 
   desc.output_mode = QR_OUTPUT_NOOUTPUT;
   desc.framebuffer_format = static_cast<qr_framebuffer_format>(99);
-  CHECK(qr_create(&desc, &ctx) == ENOTSUP);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_UNSUPPORTED);
 
   desc.framebuffer_format = QR_FRAMEBUFFER_INDEXED8;
   desc.width = U32_MAX;
   desc.height = 1;
-  CHECK(qr_create(&desc, &ctx) == EOVERFLOW);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_OVERFLOW);
 
   desc.width = U32_MAX / 2U;
   desc.height = 3;
-  CHECK(qr_create(&desc, &ctx) == EOVERFLOW);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_OVERFLOW);
 }
 
 TEST_CASE("Quake raster - nooutput clear can be inspected",
@@ -103,18 +115,19 @@ TEST_CASE("Quake raster - nooutput clear can be inspected",
   CHECK(qr_height(ctx) == HEIGHT);
   CHECK(qr_output(ctx) == QR_OUTPUT_NOOUTPUT);
 
-  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == 0);
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
   REQUIRE(frame != nullptr);
-  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == 0);
-  REQUIRE(qr_end_frame(frame) == 0);
-  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) == 0);
+  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+          QR_SUCCESS);
   padded_pixels.fill(0xaaU);
   REQUIRE(qr_read_indexed(ctx, padded_pixels.data(), padded_pixels.size(),
-                          WIDTH + 3) == 0);
+                          WIDTH + 3) == QR_SUCCESS);
   CHECK(qr_read_indexed(ctx, pixels.data(), pixels.size() - 1U, WIDTH) ==
-        ENOSPC);
+        QR_ERROR_BUFFER_TOO_SMALL);
   CHECK(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH - 1U) ==
-        EINVAL);
+        QR_ERROR_INVALID_ARGUMENT);
 
   for (std::uint8_t pixel : pixels) {
     CHECK(pixel == CLEAR_COLOR);
@@ -149,10 +162,10 @@ TEST_CASE("Quake raster - nooutput dumps indexed frames",
   qr_context *ctx = create_context_or_skip(desc);
   const auto path = temp_dump_path(".raw");
 
-  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == 0);
-  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == 0);
-  REQUIRE(qr_end_frame(frame) == 0);
-  REQUIRE(qr_dump_indexed(ctx, path.c_str()) == 0);
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_dump_indexed(ctx, path.c_str()) == QR_SUCCESS);
 
   const auto bytes = read_binary_file(path);
   REQUIRE(bytes.size() == WIDTH * HEIGHT);
@@ -186,19 +199,19 @@ TEST_CASE("Quake raster - nooutput resolves XRGB for inspection",
 
   palette[CLEAR_COLOR] = RESOLVED;
   padded_xrgb.fill(0xdeadbeefU);
-  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == 0);
-  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == 0);
-  REQUIRE(qr_end_frame(frame) == 0);
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
 
   REQUIRE(qr_read_xrgb(ctx, palette.data(), padded_xrgb.data(),
                        padded_xrgb.size() * sizeof(std::uint32_t),
-                       WIDTH + 1) == 0);
+                       WIDTH + 1) == QR_SUCCESS);
   CHECK(qr_read_xrgb(ctx, palette.data(), padded_xrgb.data(),
                      (WIDTH * HEIGHT * sizeof(std::uint32_t)) - 1U, WIDTH) ==
-        ENOSPC);
+        QR_ERROR_BUFFER_TOO_SMALL);
   CHECK(qr_read_xrgb(ctx, palette.data(), padded_xrgb.data(),
                      padded_xrgb.size() * sizeof(std::uint32_t), WIDTH - 1U) ==
-        EINVAL);
+        QR_ERROR_INVALID_ARGUMENT);
 
   for (std::uint32_t y = 0; y < HEIGHT; ++y) {
     const std::size_t row = static_cast<std::size_t>(y) * (WIDTH + 1U);
@@ -208,7 +221,7 @@ TEST_CASE("Quake raster - nooutput resolves XRGB for inspection",
     CHECK(padded_xrgb[row + WIDTH] == 0xdeadbeefU);
   }
 
-  REQUIRE(qr_dump_xrgb(ctx, palette.data(), path.c_str()) == 0);
+  REQUIRE(qr_dump_xrgb(ctx, palette.data(), path.c_str()) == QR_SUCCESS);
   const auto bytes = read_binary_file(path);
   const std::string header = "P6\n4 2\n255\n";
   REQUIRE(bytes.size() == header.size() + WIDTH * HEIGHT * 3U);

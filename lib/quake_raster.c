@@ -71,6 +71,60 @@ struct qr_context {
   int frame_active;
 };
 
+static qr_result qr_result_from_code(int code, qr_result fallback)
+{
+  switch (code) {
+  case 0:
+    return QR_SUCCESS;
+  case EINVAL:
+    return QR_ERROR_INVALID_ARGUMENT;
+  case ENOTSUP:
+    return QR_ERROR_UNSUPPORTED;
+  case EOVERFLOW:
+    return QR_ERROR_OVERFLOW;
+  case ENOMEM:
+    return QR_ERROR_OUT_OF_MEMORY;
+  case ENOSPC:
+    return QR_ERROR_NO_SPACE;
+  case EBUSY:
+    return QR_ERROR_BUSY;
+  case ENOENT:
+    return QR_ERROR_NOT_FOUND;
+  case EIO:
+    return QR_ERROR_IO;
+  default:
+    return fallback;
+  }
+}
+
+static qr_result qr_result_from_errno(int code)
+{
+  return qr_result_from_code(code, QR_ERROR_SYSTEM);
+}
+
+static qr_result qr_result_from_gpu_error(int code)
+{
+  return qr_result_from_code(code, QR_ERROR_GPU);
+}
+
+static void *qr_alloc_bytes(size_t size)
+{
+  return malloc(size);
+}
+
+static void *qr_calloc_bytes(size_t count, size_t size)
+{
+  if (count != 0U && size > SIZE_MAX / count) {
+    return NULL;
+  }
+  return calloc(count, size);
+}
+
+static void qr_free_bytes(void *ptr)
+{
+  free(ptr);
+}
+
 static int qr_validate_desc(const qr_desc *desc)
 {
   if (desc == NULL) {
@@ -194,19 +248,19 @@ static int qr_read_file(const char *path, uint8_t **out_data, size_t *out_size)
     (void)fclose(file);
     return err;
   }
-  data = (uint8_t *)malloc((size_t)size);
+  data = (uint8_t *)qr_alloc_bytes((size_t)size);
   if (data == NULL) {
     (void)fclose(file);
     return ENOMEM;
   }
   if (fread(data, 1U, (size_t)size, file) != (size_t)size) {
-    free(data);
+    qr_free_bytes(data);
     (void)fclose(file);
     return EIO;
   }
   if (fclose(file) != 0) {
     err = errno != 0 ? errno : EIO;
-    free(data);
+    qr_free_bytes(data);
     return err;
   }
 
@@ -277,7 +331,7 @@ static int qr_load_clear_kernel(qr_context *ctx)
       continue;
     }
     err = kfd_gpu_module_load(ctx->gpu, image, image_size, &ctx->clear_module);
-    free(image);
+    qr_free_bytes(image);
     if (err != 0) {
       last_err = err;
       continue;
@@ -382,7 +436,7 @@ static int qr_load_resolve_kernel(qr_context *ctx)
     }
     err = kfd_gpu_module_load(ctx->gpu, image, image_size,
                               &ctx->resolve_module);
-    free(image);
+    qr_free_bytes(image);
     if (err != 0) {
       last_err = err;
       continue;
@@ -469,15 +523,44 @@ static int qr_dispatch_resolve_xrgb(qr_context *ctx,
   return kfd_gpu_fence_wait(ctx->resolve_fence, 0U, UINT64_MAX);
 }
 
-const char *qr_strerror(int code)
+uint32_t qr_api_version(void)
 {
-  if (code == 0) {
-    return "success";
-  }
-  return kfd_gpu_strerror(code);
+  return (QR_API_VERSION_MAJOR << 16U) | (QR_API_VERSION_MINOR << 8U) |
+         QR_API_VERSION_PATCH;
 }
 
-int qr_create(const qr_desc *desc, qr_context **out)
+const char *qr_strerror(qr_result code)
+{
+  switch (code) {
+  case QR_SUCCESS:
+    return "success";
+  case QR_ERROR_INVALID_ARGUMENT:
+    return "invalid argument";
+  case QR_ERROR_UNSUPPORTED:
+    return "unsupported operation";
+  case QR_ERROR_OVERFLOW:
+    return "numeric overflow";
+  case QR_ERROR_OUT_OF_MEMORY:
+    return "out of memory";
+  case QR_ERROR_BUFFER_TOO_SMALL:
+    return "destination buffer too small";
+  case QR_ERROR_NO_SPACE:
+    return "no space available";
+  case QR_ERROR_BUSY:
+    return "resource busy";
+  case QR_ERROR_IO:
+    return "I/O error";
+  case QR_ERROR_NOT_FOUND:
+    return "not found";
+  case QR_ERROR_SYSTEM:
+    return "system error";
+  case QR_ERROR_GPU:
+    return "GPU operation failed";
+  }
+  return "unknown error";
+}
+
+qr_result qr_create(const qr_desc *desc, qr_context **out)
 {
   qr_context *ctx;
   kfd_gpu_context *gpu;
@@ -487,19 +570,19 @@ int qr_create(const qr_desc *desc, qr_context **out)
   int err;
 
   if (out == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   *out = NULL;
   err = qr_validate_desc(desc);
   if (err != 0) {
-    return err;
+    return qr_result_from_errno(err);
   }
 
   indexed_bytes = (size_t)desc->width * (size_t)desc->height;
   xrgb_bytes = indexed_bytes * sizeof(uint32_t);
   err = kfd_gpu_context_create(desc->device_index, &gpu);
   if (err != 0) {
-    return err;
+    return qr_result_from_gpu_error(err);
   }
   err = kfd_gpu_buffer_create(gpu, indexed_bytes, KFD_GPU_MEMORY_UPLOAD,
                               KFD_GPU_MEMORY_WRITABLE |
@@ -508,14 +591,14 @@ int qr_create(const qr_desc *desc, qr_context **out)
                               &indexed);
   if (err != 0) {
     kfd_gpu_context_destroy(gpu);
-    return err;
+    return qr_result_from_gpu_error(err);
   }
 
-  ctx = (qr_context *)calloc(1U, sizeof(*ctx));
+  ctx = (qr_context *)qr_calloc_bytes(1U, sizeof(*ctx));
   if (ctx == NULL) {
     kfd_gpu_buffer_destroy(indexed);
     kfd_gpu_context_destroy(gpu);
-    return ENOMEM;
+    return QR_ERROR_OUT_OF_MEMORY;
   }
 
   ctx->gpu = gpu;
@@ -531,8 +614,8 @@ int qr_create(const qr_desc *desc, qr_context **out)
     qr_destroy_clear_kernel(ctx);
     kfd_gpu_buffer_destroy(indexed);
     kfd_gpu_context_destroy(gpu);
-    free(ctx);
-    return err;
+    qr_free_bytes(ctx);
+    return qr_result_from_errno(err);
   }
   err = qr_load_resolve_kernel(ctx);
   if (err != 0) {
@@ -540,11 +623,11 @@ int qr_create(const qr_desc *desc, qr_context **out)
     qr_destroy_clear_kernel(ctx);
     kfd_gpu_buffer_destroy(indexed);
     kfd_gpu_context_destroy(gpu);
-    free(ctx);
-    return err;
+    qr_free_bytes(ctx);
+    return qr_result_from_errno(err);
   }
   *out = ctx;
-  return 0;
+  return QR_SUCCESS;
 }
 
 void qr_destroy(qr_context *ctx)
@@ -556,7 +639,7 @@ void qr_destroy(qr_context *ctx)
   qr_destroy_clear_kernel(ctx);
   kfd_gpu_buffer_destroy(ctx->indexed);
   kfd_gpu_context_destroy(ctx->gpu);
-  free(ctx);
+  qr_free_bytes(ctx);
 }
 
 uint32_t qr_width(const qr_context *ctx)
@@ -574,59 +657,61 @@ qr_output_mode qr_output(const qr_context *ctx)
   return ctx != NULL ? ctx->output_mode : QR_OUTPUT_NOOUTPUT;
 }
 
-int qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc, qr_frame **out)
+qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
+                         qr_frame **out)
 {
   (void)desc;
   if (ctx == NULL || out == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   if (ctx->frame_active != 0) {
-    return EBUSY;
+    return QR_ERROR_BUSY;
   }
   ctx->frame_active = 1;
   *out = &ctx->frame;
-  return 0;
+  return QR_SUCCESS;
 }
 
-int qr_frame_clear_indexed(qr_frame *frame, uint8_t color)
+qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color)
 {
   qr_clear_indexed_args *args;
   int err;
 
   if (frame == NULL || frame->ctx == NULL || frame->ctx->clear_root == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   if (frame->ctx->frame_active == 0) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   args = (qr_clear_indexed_args *)kfd_gpu_buffer_cpu(frame->ctx->clear_root);
   if (args == NULL) {
-    return EIO;
+    return QR_ERROR_IO;
   }
   args->color = (uint32_t)color;
   err = kfd_gpu_dispatch(frame->ctx->gpu, frame->ctx->clear_kernel,
                          &frame->ctx->clear_dispatch,
                          frame->ctx->clear_kernarg, frame->ctx->clear_fence);
   if (err != 0) {
-    return err;
+    return qr_result_from_gpu_error(err);
   }
-  return kfd_gpu_fence_wait(frame->ctx->clear_fence, 0U, UINT64_MAX);
+  return qr_result_from_gpu_error(
+      kfd_gpu_fence_wait(frame->ctx->clear_fence, 0U, UINT64_MAX));
 }
 
-int qr_end_frame(qr_frame *frame)
+qr_result qr_end_frame(qr_frame *frame)
 {
   if (frame == NULL || frame->ctx == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   if (frame->ctx->frame_active == 0) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   frame->ctx->frame_active = 0;
-  return 0;
+  return QR_SUCCESS;
 }
 
-int qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
-                    size_t dst_stride)
+qr_result qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
+                          size_t dst_stride)
 {
   const uint8_t *src_row;
   uint8_t *dst_row;
@@ -636,19 +721,19 @@ int qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
   int err;
 
   if (ctx == NULL || dst == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   stride = dst_stride != 0U ? dst_stride : (size_t)ctx->width;
   err = qr_indexed_read_size(ctx->width, ctx->height, stride, &required);
   if (err != 0) {
-    return err;
+    return qr_result_from_errno(err);
   }
   if (dst_size < required) {
-    return ENOSPC;
+    return QR_ERROR_BUFFER_TOO_SMALL;
   }
   src_row = (const uint8_t *)kfd_gpu_buffer_cpu(ctx->indexed);
   if (src_row == NULL) {
-    return EIO;
+    return QR_ERROR_IO;
   }
   dst_row = (uint8_t *)dst;
   for (y = 0U; y < ctx->height; ++y) {
@@ -656,11 +741,11 @@ int qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
     src_row += ctx->width;
     dst_row += stride;
   }
-  return 0;
+  return QR_SUCCESS;
 }
 
-int qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
-                 size_t dst_size, size_t dst_stride_pixels)
+qr_result qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
+                       size_t dst_size, size_t dst_stride_pixels)
 {
   const uint32_t *src_row;
   uint32_t *dst_row;
@@ -670,24 +755,24 @@ int qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
   int err;
 
   if (ctx == NULL || palette_xrgb == NULL || dst == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   stride_pixels =
       dst_stride_pixels != 0U ? dst_stride_pixels : (size_t)ctx->width;
   err = qr_xrgb_read_size(ctx->width, ctx->height, stride_pixels, &required);
   if (err != 0) {
-    return err;
+    return qr_result_from_errno(err);
   }
   if (dst_size < required) {
-    return ENOSPC;
+    return QR_ERROR_BUFFER_TOO_SMALL;
   }
   err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb);
   if (err != 0) {
-    return err;
+    return qr_result_from_gpu_error(err);
   }
   src_row = (const uint32_t *)kfd_gpu_buffer_cpu(ctx->xrgb);
   if (src_row == NULL) {
-    return EIO;
+    return QR_ERROR_IO;
   }
   dst_row = (uint32_t *)dst;
   for (y = 0U; y < ctx->height; ++y) {
@@ -695,10 +780,10 @@ int qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
     src_row += ctx->width;
     dst_row += stride_pixels;
   }
-  return 0;
+  return QR_SUCCESS;
 }
 
-int qr_dump_indexed(qr_context *ctx, const char *path)
+qr_result qr_dump_indexed(qr_context *ctx, const char *path)
 {
   const uint8_t *src_row;
   FILE *file;
@@ -706,32 +791,32 @@ int qr_dump_indexed(qr_context *ctx, const char *path)
   int err;
 
   if (ctx == NULL || path == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   src_row = (const uint8_t *)kfd_gpu_buffer_cpu(ctx->indexed);
   if (src_row == NULL) {
-    return EIO;
+    return QR_ERROR_IO;
   }
   file = fopen(path, "wb");
   if (file == NULL) {
-    return errno != 0 ? errno : EIO;
+    return qr_result_from_errno(errno != 0 ? errno : EIO);
   }
   for (y = 0U; y < ctx->height; ++y) {
     err = qr_write_all(file, src_row, (size_t)ctx->width);
     if (err != 0) {
       (void)fclose(file);
-      return err;
+      return qr_result_from_errno(err);
     }
     src_row += ctx->width;
   }
   if (fclose(file) != 0) {
-    return errno != 0 ? errno : EIO;
+    return qr_result_from_errno(errno != 0 ? errno : EIO);
   }
-  return 0;
+  return QR_SUCCESS;
 }
 
-int qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
-                 const char *path)
+qr_result qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
+                       const char *path)
 {
   const uint32_t *src_row;
   char header[64];
@@ -741,29 +826,29 @@ int qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
   int err;
 
   if (ctx == NULL || palette_xrgb == NULL || path == NULL) {
-    return EINVAL;
+    return QR_ERROR_INVALID_ARGUMENT;
   }
   err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb);
   if (err != 0) {
-    return err;
+    return qr_result_from_gpu_error(err);
   }
   src_row = (const uint32_t *)kfd_gpu_buffer_cpu(ctx->xrgb);
   if (src_row == NULL) {
-    return EIO;
+    return QR_ERROR_IO;
   }
   header_size = snprintf(header, sizeof(header), "P6\n%u %u\n255\n",
                          ctx->width, ctx->height);
   if (header_size < 0 || (size_t)header_size >= sizeof(header)) {
-    return EOVERFLOW;
+    return QR_ERROR_OVERFLOW;
   }
   file = fopen(path, "wb");
   if (file == NULL) {
-    return errno != 0 ? errno : EIO;
+    return qr_result_from_errno(errno != 0 ? errno : EIO);
   }
   err = qr_write_all(file, header, (size_t)header_size);
   if (err != 0) {
     (void)fclose(file);
-    return err;
+    return qr_result_from_errno(err);
   }
   for (y = 0U; y < ctx->height; ++y) {
     uint32_t x;
@@ -779,13 +864,13 @@ int qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
       err = qr_write_all(file, rgb, sizeof(rgb));
       if (err != 0) {
         (void)fclose(file);
-        return err;
+        return qr_result_from_errno(err);
       }
     }
     src_row += ctx->width;
   }
   if (fclose(file) != 0) {
-    return errno != 0 ? errno : EIO;
+    return qr_result_from_errno(errno != 0 ? errno : EIO);
   }
-  return 0;
+  return QR_SUCCESS;
 }

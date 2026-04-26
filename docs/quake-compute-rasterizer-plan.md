@@ -92,7 +92,7 @@ The public API should be context-based:
 struct qr_context;
 struct qr_frame;
 
-int qr_create(const struct qr_desc *desc, struct qr_context **out);
+qr_result qr_create(const struct qr_desc *desc, struct qr_context **out);
 void qr_destroy(struct qr_context *ctx);
 int qr_begin_frame(struct qr_context *ctx, const struct qr_frame_desc *desc,
 	struct qr_frame **out);
