@@ -235,3 +235,139 @@ TEST_CASE("Quake raster - nooutput resolves XRGB for inspection",
   std::filesystem::remove(path);
   qr_destroy(ctx);
 }
+
+TEST_CASE("Quake raster - uploads synthetic persistent resources",
+          "[quake_raster][device]") {
+  qr_context *ctx = nullptr;
+  qr_desc desc{
+      .width = 8,
+      .height = 8,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 2,
+      .max_lightmaps = 2,
+      .max_surfaces = 4,
+      .max_worlds = 1,
+      .texture_atlas_bytes = 64,
+      .lightmap_atlas_bytes = 32,
+  };
+  const std::array<std::uint8_t, 16> tex0{
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  const std::array<std::uint8_t, 4> tex1{16, 17, 18, 19};
+  const std::array<std::uint8_t, 4> light{7, 8, 9, 10};
+  qr_texture texture = QR_INVALID_HANDLE;
+  qr_lightmap lightmap = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc texture_desc{
+      .mips =
+          {
+              {.pixels = tex0.data(), .width = 4, .height = 4, .stride = 4},
+              {.pixels = tex1.data(), .width = 2, .height = 2, .stride = 2},
+          },
+      .mip_count = 2,
+      .flags = 0,
+  };
+  qr_lightmap_desc lightmap_desc{
+      .pixels = light.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  std::array<qr_world_surface_desc, 2> surfaces{};
+  qr_capacity_info capacity{};
+
+  ctx = create_context_or_skip(desc);
+
+  REQUIRE(qr_upload_texture(ctx, &texture_desc, &texture) == QR_SUCCESS);
+  REQUIRE(texture != QR_INVALID_HANDLE);
+  REQUIRE(qr_upload_lightmap(ctx, &lightmap_desc, &lightmap) == QR_SUCCESS);
+  REQUIRE(lightmap != QR_INVALID_HANDLE);
+
+  surfaces[0].texture = texture;
+  surfaces[0].lightmap = lightmap;
+  surfaces[0].plane[2] = 1.0F;
+  surfaces[0].tex_s[0] = 1.0F;
+  surfaces[0].tex_t[1] = 1.0F;
+  surfaces[0].light_s[0] = 0.5F;
+  surfaces[0].light_t[1] = 0.5F;
+  surfaces[1] = surfaces[0];
+  surfaces[1].flags = 1;
+
+  surfaces[1].texture = 999U;
+  CHECK(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+        QR_ERROR_INVALID_ARGUMENT);
+  surfaces[1].texture = texture;
+
+  REQUIRE(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+          QR_SUCCESS);
+  REQUIRE(world != QR_INVALID_HANDLE);
+  REQUIRE(qr_get_capacity_info(ctx, &capacity) == QR_SUCCESS);
+  CHECK(capacity.texture_count == 1);
+  CHECK(capacity.texture_capacity == 2);
+  CHECK(capacity.texture_atlas_used == tex0.size() + tex1.size());
+  CHECK(capacity.lightmap_count == 1);
+  CHECK(capacity.lightmap_atlas_used == light.size());
+  CHECK(capacity.surface_count == surfaces.size());
+  CHECK(capacity.surface_capacity == 4);
+  CHECK(capacity.world_count == 1);
+  CHECK(capacity.world_capacity == 1);
+
+  CHECK(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+        QR_ERROR_NO_SPACE);
+
+  REQUIRE(qr_upload_texture(ctx, &texture_desc, &texture) == QR_SUCCESS);
+  CHECK(qr_upload_texture(ctx, &texture_desc, &texture) == QR_ERROR_NO_SPACE);
+  REQUIRE(qr_upload_lightmap(ctx, &lightmap_desc, &lightmap) == QR_SUCCESS);
+  CHECK(qr_upload_lightmap(ctx, &lightmap_desc, &lightmap) ==
+        QR_ERROR_NO_SPACE);
+
+  qr_destroy(ctx);
+}
+
+TEST_CASE("Quake raster - resource uploads reject undersized atlases",
+          "[quake_raster][device]") {
+  qr_desc desc{
+      .width = 8,
+      .height = 8,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .texture_atlas_bytes = 4,
+      .lightmap_atlas_bytes = 2,
+  };
+  const std::array<std::uint8_t, 16> texture_pixels{};
+  const std::array<std::uint8_t, 4> lightmap_pixels{};
+  qr_texture texture = QR_INVALID_HANDLE;
+  qr_lightmap lightmap = QR_INVALID_HANDLE;
+  qr_texture_desc texture_desc{
+      .mips =
+          {
+              {.pixels = texture_pixels.data(),
+               .width = 4,
+               .height = 4,
+               .stride = 4},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lightmap_desc{
+      .pixels = lightmap_pixels.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+
+  CHECK(qr_upload_texture(ctx, &texture_desc, &texture) == QR_ERROR_NO_SPACE);
+  CHECK(texture == QR_INVALID_HANDLE);
+  CHECK(qr_upload_lightmap(ctx, &lightmap_desc, &lightmap) ==
+        QR_ERROR_NO_SPACE);
+  CHECK(lightmap == QR_INVALID_HANDLE);
+
+  qr_destroy(ctx);
+}

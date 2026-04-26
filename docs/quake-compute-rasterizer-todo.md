@@ -56,13 +56,13 @@ Exit criteria:
 
 ## Milestone 3: Resource Model
 
-- [ ] Define renderer resource handles: texture, lightmap, surface, world.
-- [ ] Add fixed-capacity or arena-backed resource tables.
-- [ ] Add texture atlas builder for 8-bit Quake mip levels.
-- [ ] Add lightmap atlas/page storage.
-- [ ] Add world surface metadata buffer.
-- [ ] Add upload/update APIs for static resources.
-- [ ] Add capacity telemetry for atlas usage and resource counts.
+- [x] Define renderer resource handles: texture, lightmap, surface, world.
+- [x] Add fixed-capacity or arena-backed resource tables.
+- [x] Add linear texture atlas builder for 8-bit Quake mip levels.
+- [x] Add lightmap atlas/page storage.
+- [x] Add world surface metadata buffer.
+- [x] Add upload/update APIs for static resources.
+- [x] Add capacity telemetry for atlas usage and resource counts.
 
 Exit criteria:
 

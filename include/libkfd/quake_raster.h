@@ -21,6 +21,8 @@ typedef struct qr_frame qr_frame;
 #define QR_API_VERSION_MAJOR 0U
 #define QR_API_VERSION_MINOR 1U
 #define QR_API_VERSION_PATCH 0U
+#define QR_TEXTURE_MIP_COUNT 4U
+#define QR_INVALID_HANDLE 0U
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -46,17 +48,74 @@ typedef enum qr_framebuffer_format {
   QR_FRAMEBUFFER_INDEXED8 = 0
 } qr_framebuffer_format;
 
+typedef uint32_t qr_texture;
+typedef uint32_t qr_lightmap;
+typedef uint32_t qr_world;
+
 typedef struct qr_desc {
   uint32_t width;
   uint32_t height;
   size_t device_index;
   qr_output_mode output_mode;
   qr_framebuffer_format framebuffer_format;
+  /* Zero capacity/budget fields select renderer defaults. */
+  uint32_t max_textures;
+  uint32_t max_lightmaps;
+  uint32_t max_surfaces;
+  uint32_t max_worlds;
+  size_t texture_atlas_bytes;
+  size_t lightmap_atlas_bytes;
 } qr_desc;
 
 typedef struct qr_frame_desc {
   uint32_t reserved;
 } qr_frame_desc;
+
+typedef struct qr_texture_mip_desc {
+  const void *pixels;
+  uint32_t width;
+  uint32_t height;
+  size_t stride;
+} qr_texture_mip_desc;
+
+typedef struct qr_texture_desc {
+  qr_texture_mip_desc mips[QR_TEXTURE_MIP_COUNT];
+  uint32_t mip_count;
+  uint32_t flags;
+} qr_texture_desc;
+
+typedef struct qr_lightmap_desc {
+  const void *pixels;
+  uint32_t width;
+  uint32_t height;
+  size_t stride;
+} qr_lightmap_desc;
+
+typedef struct qr_world_surface_desc {
+  qr_texture texture;
+  qr_lightmap lightmap;
+  uint32_t flags;
+  float plane[4];
+  float tex_s[4];
+  float tex_t[4];
+  float light_s[4];
+  float light_t[4];
+} qr_world_surface_desc;
+
+typedef struct qr_capacity_info {
+  uint32_t texture_count;
+  uint32_t texture_capacity;
+  size_t texture_atlas_used;
+  size_t texture_atlas_capacity;
+  uint32_t lightmap_count;
+  uint32_t lightmap_capacity;
+  size_t lightmap_atlas_used;
+  size_t lightmap_atlas_capacity;
+  uint32_t surface_count;
+  uint32_t surface_capacity;
+  uint32_t world_count;
+  uint32_t world_capacity;
+} qr_capacity_info;
 
 /* Returns QR_API_VERSION_* packed in 8-bit fields as 0x00MMmmPP. */
 uint32_t qr_api_version(void);
@@ -100,6 +159,19 @@ qr_result qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
 qr_result qr_dump_indexed(qr_context *ctx, const char *path);
 qr_result qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
                        const char *path);
+
+/*
+ * Persistent resources are append-only and owned by the context. Handles are
+ * stable for the lifetime of the context and start at 1; QR_INVALID_HANDLE is
+ * never returned.
+ */
+qr_result qr_upload_texture(qr_context *ctx, const qr_texture_desc *desc,
+                            qr_texture *out);
+qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
+                             qr_lightmap *out);
+qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
+                          size_t surface_count, qr_world *out);
+qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

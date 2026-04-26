@@ -10,6 +10,12 @@
 
 #define QR_CLEAR_BLOCK_X 16U
 #define QR_CLEAR_BLOCK_Y 16U
+#define QR_DEFAULT_MAX_TEXTURES 1024U
+#define QR_DEFAULT_MAX_LIGHTMAPS 1024U
+#define QR_DEFAULT_MAX_SURFACES 65536U
+#define QR_DEFAULT_MAX_WORLDS 256U
+#define QR_DEFAULT_TEXTURE_ATLAS_BYTES (16U * 1024U * 1024U)
+#define QR_DEFAULT_LIGHTMAP_ATLAS_BYTES (4U * 1024U * 1024U)
 
 typedef struct qr_kernel_candidate {
   const char *path;
@@ -31,6 +37,36 @@ typedef struct qr_resolve_xrgb_args {
   uint32_t height;
 } qr_resolve_xrgb_args;
 
+typedef struct qr_texture_record {
+  uint32_t mip_offset[QR_TEXTURE_MIP_COUNT];
+  uint32_t width[QR_TEXTURE_MIP_COUNT];
+  uint32_t height[QR_TEXTURE_MIP_COUNT];
+  uint32_t mip_count;
+  uint32_t flags;
+} qr_texture_record;
+
+typedef struct qr_lightmap_record {
+  uint32_t offset;
+  uint32_t width;
+  uint32_t height;
+} qr_lightmap_record;
+
+typedef struct qr_surface_record {
+  uint32_t texture;
+  uint32_t lightmap;
+  uint32_t flags;
+  float plane[4];
+  float tex_s[4];
+  float tex_t[4];
+  float light_s[4];
+  float light_t[4];
+} qr_surface_record;
+
+typedef struct qr_world_record {
+  uint32_t first_surface;
+  uint32_t surface_count;
+} qr_world_record;
+
 static const qr_kernel_candidate qr_clear_indexed_kernels[] = {
 #include "quake_raster_clear_indexed_kernels.inc"
     {NULL, NULL}
@@ -50,6 +86,12 @@ struct qr_context {
   kfd_gpu_buffer *indexed;
   kfd_gpu_buffer *xrgb;
   kfd_gpu_buffer *resolve_palette;
+  kfd_gpu_buffer *texture_atlas;
+  kfd_gpu_buffer *lightmap_atlas;
+  kfd_gpu_buffer *surface_metadata;
+  qr_texture_record *textures;
+  qr_lightmap_record *lightmaps;
+  qr_world_record *worlds;
   kfd_gpu_module *clear_module;
   kfd_gpu_kernel *clear_kernel;
   kfd_gpu_buffer *clear_root;
@@ -66,6 +108,18 @@ struct qr_context {
   uint32_t height;
   size_t indexed_bytes;
   size_t xrgb_bytes;
+  size_t texture_atlas_bytes;
+  size_t texture_atlas_used;
+  size_t lightmap_atlas_bytes;
+  size_t lightmap_atlas_used;
+  uint32_t texture_capacity;
+  uint32_t texture_count;
+  uint32_t lightmap_capacity;
+  uint32_t lightmap_count;
+  uint32_t surface_capacity;
+  uint32_t surface_count;
+  uint32_t world_capacity;
+  uint32_t world_count;
   qr_output_mode output_mode;
   struct qr_frame frame;
   int frame_active;
@@ -123,6 +177,66 @@ static void *qr_calloc_bytes(size_t count, size_t size)
 static void qr_free_bytes(void *ptr)
 {
   free(ptr);
+}
+
+static uint32_t qr_default_u32(uint32_t value, uint32_t fallback)
+{
+  return value != 0U ? value : fallback;
+}
+
+static size_t qr_default_size(size_t value, size_t fallback)
+{
+  return value != 0U ? value : fallback;
+}
+
+static int qr_rect_tight_size(uint32_t width, uint32_t height, size_t *out);
+
+static int qr_copy_indexed_rect(uint8_t *dst, size_t dst_offset,
+                                size_t dst_size, const void *src,
+                                uint32_t width, uint32_t height,
+                                size_t stride)
+{
+  const uint8_t *src_row;
+  uint8_t *dst_row;
+  size_t bytes;
+  uint32_t y;
+  int err;
+
+  if (dst == NULL || src == NULL || width == 0U || height == 0U) {
+    return EINVAL;
+  }
+  if (stride == 0U) {
+    stride = (size_t)width;
+  }
+  err = qr_rect_tight_size(width, height, &bytes);
+  if (err != 0) {
+    return err;
+  }
+  if (stride < (size_t)width || dst_offset > dst_size ||
+      bytes > dst_size - dst_offset) {
+    return EINVAL;
+  }
+
+  src_row = (const uint8_t *)src;
+  dst_row = dst + dst_offset;
+  for (y = 0U; y < height; ++y) {
+    memcpy(dst_row, src_row, (size_t)width);
+    src_row += stride;
+    dst_row += width;
+  }
+  return 0;
+}
+
+static int qr_rect_tight_size(uint32_t width, uint32_t height, size_t *out)
+{
+  if (out == NULL || width == 0U || height == 0U) {
+    return EINVAL;
+  }
+  if ((size_t)width > SIZE_MAX / (size_t)height) {
+    return EOVERFLOW;
+  }
+  *out = (size_t)width * (size_t)height;
+  return 0;
 }
 
 static int qr_validate_desc(const qr_desc *desc)
@@ -523,6 +637,105 @@ static int qr_dispatch_resolve_xrgb(qr_context *ctx,
   return kfd_gpu_fence_wait(ctx->resolve_fence, 0U, UINT64_MAX);
 }
 
+static void qr_destroy_resources(qr_context *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  qr_free_bytes(ctx->worlds);
+  qr_free_bytes(ctx->lightmaps);
+  qr_free_bytes(ctx->textures);
+  kfd_gpu_buffer_destroy(ctx->surface_metadata);
+  kfd_gpu_buffer_destroy(ctx->lightmap_atlas);
+  kfd_gpu_buffer_destroy(ctx->texture_atlas);
+  ctx->worlds = NULL;
+  ctx->lightmaps = NULL;
+  ctx->textures = NULL;
+  ctx->surface_metadata = NULL;
+  ctx->lightmap_atlas = NULL;
+  ctx->texture_atlas = NULL;
+}
+
+static int qr_create_upload_buffer(qr_context *ctx, size_t size,
+                                   kfd_gpu_buffer **out)
+{
+  return kfd_gpu_buffer_create(ctx->gpu, size, KFD_GPU_MEMORY_UPLOAD,
+                               KFD_GPU_MEMORY_WRITABLE |
+                                   KFD_GPU_MEMORY_COHERENT |
+                                   KFD_GPU_MEMORY_UNCACHED,
+                               out);
+}
+
+static int qr_init_resources(qr_context *ctx, const qr_desc *desc)
+{
+  size_t texture_slots;
+  size_t lightmap_slots;
+  size_t world_slots;
+  size_t surface_bytes;
+  int err;
+
+  if (ctx == NULL || desc == NULL) {
+    return EINVAL;
+  }
+  ctx->texture_capacity =
+      qr_default_u32(desc->max_textures, QR_DEFAULT_MAX_TEXTURES);
+  ctx->lightmap_capacity =
+      qr_default_u32(desc->max_lightmaps, QR_DEFAULT_MAX_LIGHTMAPS);
+  ctx->surface_capacity =
+      qr_default_u32(desc->max_surfaces, QR_DEFAULT_MAX_SURFACES);
+  ctx->world_capacity = qr_default_u32(desc->max_worlds, QR_DEFAULT_MAX_WORLDS);
+  ctx->texture_atlas_bytes =
+      qr_default_size(desc->texture_atlas_bytes, QR_DEFAULT_TEXTURE_ATLAS_BYTES);
+  ctx->lightmap_atlas_bytes =
+      qr_default_size(desc->lightmap_atlas_bytes, QR_DEFAULT_LIGHTMAP_ATLAS_BYTES);
+
+  if (ctx->texture_capacity == UINT32_MAX ||
+      ctx->lightmap_capacity == UINT32_MAX ||
+      ctx->world_capacity == UINT32_MAX) {
+    return EOVERFLOW;
+  }
+  texture_slots = (size_t)ctx->texture_capacity + 1U;
+  lightmap_slots = (size_t)ctx->lightmap_capacity + 1U;
+  world_slots = (size_t)ctx->world_capacity + 1U;
+  if (texture_slots > SIZE_MAX / sizeof(*ctx->textures) ||
+      lightmap_slots > SIZE_MAX / sizeof(*ctx->lightmaps) ||
+      world_slots > SIZE_MAX / sizeof(*ctx->worlds) ||
+      (size_t)ctx->surface_capacity > SIZE_MAX / sizeof(qr_surface_record)) {
+    return EOVERFLOW;
+  }
+  surface_bytes = (size_t)ctx->surface_capacity * sizeof(qr_surface_record);
+
+  ctx->textures =
+      (qr_texture_record *)qr_calloc_bytes(texture_slots, sizeof(*ctx->textures));
+  ctx->lightmaps = (qr_lightmap_record *)qr_calloc_bytes(
+      lightmap_slots, sizeof(*ctx->lightmaps));
+  ctx->worlds =
+      (qr_world_record *)qr_calloc_bytes(world_slots, sizeof(*ctx->worlds));
+  if (ctx->textures == NULL || ctx->lightmaps == NULL || ctx->worlds == NULL) {
+    qr_destroy_resources(ctx);
+    return ENOMEM;
+  }
+
+  err = qr_create_upload_buffer(ctx, ctx->texture_atlas_bytes,
+                                &ctx->texture_atlas);
+  if (err != 0) {
+    qr_destroy_resources(ctx);
+    return err;
+  }
+  err = qr_create_upload_buffer(ctx, ctx->lightmap_atlas_bytes,
+                                &ctx->lightmap_atlas);
+  if (err != 0) {
+    qr_destroy_resources(ctx);
+    return err;
+  }
+  err = qr_create_upload_buffer(ctx, surface_bytes, &ctx->surface_metadata);
+  if (err != 0) {
+    qr_destroy_resources(ctx);
+    return err;
+  }
+  return 0;
+}
+
 uint32_t qr_api_version(void)
 {
   return (QR_API_VERSION_MAJOR << 16U) | (QR_API_VERSION_MINOR << 8U) |
@@ -609,9 +822,18 @@ qr_result qr_create(const qr_desc *desc, qr_context **out)
   ctx->xrgb_bytes = xrgb_bytes;
   ctx->output_mode = desc->output_mode;
   ctx->frame.ctx = ctx;
+  err = qr_init_resources(ctx, desc);
+  if (err != 0) {
+    qr_destroy_resources(ctx);
+    kfd_gpu_buffer_destroy(indexed);
+    kfd_gpu_context_destroy(gpu);
+    qr_free_bytes(ctx);
+    return qr_result_from_errno(err);
+  }
   err = qr_load_clear_kernel(ctx);
   if (err != 0) {
     qr_destroy_clear_kernel(ctx);
+    qr_destroy_resources(ctx);
     kfd_gpu_buffer_destroy(indexed);
     kfd_gpu_context_destroy(gpu);
     qr_free_bytes(ctx);
@@ -621,6 +843,7 @@ qr_result qr_create(const qr_desc *desc, qr_context **out)
   if (err != 0) {
     qr_destroy_resolve_kernel(ctx);
     qr_destroy_clear_kernel(ctx);
+    qr_destroy_resources(ctx);
     kfd_gpu_buffer_destroy(indexed);
     kfd_gpu_context_destroy(gpu);
     qr_free_bytes(ctx);
@@ -637,6 +860,7 @@ void qr_destroy(qr_context *ctx)
   }
   qr_destroy_resolve_kernel(ctx);
   qr_destroy_clear_kernel(ctx);
+  qr_destroy_resources(ctx);
   kfd_gpu_buffer_destroy(ctx->indexed);
   kfd_gpu_context_destroy(ctx->gpu);
   qr_free_bytes(ctx);
@@ -872,5 +1096,208 @@ qr_result qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
   if (fclose(file) != 0) {
     return qr_result_from_errno(errno != 0 ? errno : EIO);
   }
+  return QR_SUCCESS;
+}
+
+qr_result qr_upload_texture(qr_context *ctx, const qr_texture_desc *desc,
+                            qr_texture *out)
+{
+  qr_texture_record record;
+  uint8_t *atlas;
+  size_t mip_bytes[QR_TEXTURE_MIP_COUNT];
+  size_t total_bytes;
+  uint32_t i;
+  int err;
+
+  if (ctx == NULL || desc == NULL || out == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  *out = QR_INVALID_HANDLE;
+  if (desc->mip_count == 0U || desc->mip_count > QR_TEXTURE_MIP_COUNT) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  if (ctx->texture_count >= ctx->texture_capacity) {
+    return QR_ERROR_NO_SPACE;
+  }
+  atlas = (uint8_t *)kfd_gpu_buffer_cpu(ctx->texture_atlas);
+  if (atlas == NULL) {
+    return QR_ERROR_IO;
+  }
+
+  memset(&record, 0, sizeof(record));
+  total_bytes = 0U;
+  for (i = 0U; i < desc->mip_count; ++i) {
+    const qr_texture_mip_desc *mip = &desc->mips[i];
+    size_t stride = mip->stride != 0U ? mip->stride : (size_t)mip->width;
+
+    if (mip->pixels == NULL || mip->width == 0U || mip->height == 0U ||
+        stride < (size_t)mip->width) {
+      return QR_ERROR_INVALID_ARGUMENT;
+    }
+    err = qr_rect_tight_size(mip->width, mip->height, &mip_bytes[i]);
+    if (err != 0) {
+      return qr_result_from_errno(err);
+    }
+    if (total_bytes > SIZE_MAX - mip_bytes[i] ||
+        ctx->texture_atlas_used > ctx->texture_atlas_bytes ||
+        total_bytes > ctx->texture_atlas_bytes - ctx->texture_atlas_used ||
+        mip_bytes[i] >
+            ctx->texture_atlas_bytes - ctx->texture_atlas_used - total_bytes ||
+        ctx->texture_atlas_used + total_bytes > UINT32_MAX) {
+      return QR_ERROR_NO_SPACE;
+    }
+    record.mip_offset[i] =
+        (uint32_t)(ctx->texture_atlas_used + total_bytes);
+    record.width[i] = mip->width;
+    record.height[i] = mip->height;
+    total_bytes += mip_bytes[i];
+  }
+
+  for (i = 0U; i < desc->mip_count; ++i) {
+    const qr_texture_mip_desc *mip = &desc->mips[i];
+    err = qr_copy_indexed_rect(atlas, record.mip_offset[i],
+                               ctx->texture_atlas_bytes, mip->pixels,
+                               mip->width, mip->height, mip->stride);
+    if (err != 0) {
+      return qr_result_from_errno(err);
+    }
+  }
+
+  record.mip_count = desc->mip_count;
+  record.flags = desc->flags;
+  ++ctx->texture_count;
+  ctx->textures[ctx->texture_count] = record;
+  ctx->texture_atlas_used += total_bytes;
+  *out = ctx->texture_count;
+  return QR_SUCCESS;
+}
+
+qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
+                             qr_lightmap *out)
+{
+  qr_lightmap_record record;
+  uint8_t *atlas;
+  size_t bytes;
+  int err;
+
+  if (ctx == NULL || desc == NULL || out == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  *out = QR_INVALID_HANDLE;
+  if (desc->pixels == NULL || desc->width == 0U || desc->height == 0U) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  if (ctx->lightmap_count >= ctx->lightmap_capacity) {
+    return QR_ERROR_NO_SPACE;
+  }
+  err = qr_rect_tight_size(desc->width, desc->height, &bytes);
+  if (err != 0) {
+    return qr_result_from_errno(err);
+  }
+  if (ctx->lightmap_atlas_used > ctx->lightmap_atlas_bytes ||
+      bytes > ctx->lightmap_atlas_bytes - ctx->lightmap_atlas_used ||
+      ctx->lightmap_atlas_used > UINT32_MAX ||
+      bytes > (size_t)UINT32_MAX - ctx->lightmap_atlas_used) {
+    return QR_ERROR_NO_SPACE;
+  }
+  atlas = (uint8_t *)kfd_gpu_buffer_cpu(ctx->lightmap_atlas);
+  if (atlas == NULL) {
+    return QR_ERROR_IO;
+  }
+  err = qr_copy_indexed_rect(atlas, ctx->lightmap_atlas_used,
+                             ctx->lightmap_atlas_bytes, desc->pixels,
+                             desc->width, desc->height, desc->stride);
+  if (err != 0) {
+    return qr_result_from_errno(err);
+  }
+
+  record.offset = (uint32_t)ctx->lightmap_atlas_used;
+  record.width = desc->width;
+  record.height = desc->height;
+  ++ctx->lightmap_count;
+  ctx->lightmaps[ctx->lightmap_count] = record;
+  ctx->lightmap_atlas_used += bytes;
+  *out = ctx->lightmap_count;
+  return QR_SUCCESS;
+}
+
+qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
+                          size_t surface_count, qr_world *out)
+{
+  qr_surface_record *dst;
+  uint32_t first_surface;
+  uint32_t remaining_surfaces;
+  size_t i;
+
+  if (ctx == NULL || surfaces == NULL || out == NULL || surface_count == 0U) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  *out = QR_INVALID_HANDLE;
+  if (ctx->surface_count > ctx->surface_capacity) {
+    return QR_ERROR_SYSTEM;
+  }
+  remaining_surfaces = ctx->surface_capacity - ctx->surface_count;
+  if (surface_count > UINT32_MAX ||
+      surface_count > (size_t)remaining_surfaces) {
+    return QR_ERROR_NO_SPACE;
+  }
+  if (ctx->world_count >= ctx->world_capacity) {
+    return QR_ERROR_NO_SPACE;
+  }
+  dst = (qr_surface_record *)kfd_gpu_buffer_cpu(ctx->surface_metadata);
+  if (dst == NULL) {
+    return QR_ERROR_IO;
+  }
+  for (i = 0U; i < surface_count; ++i) {
+    const qr_world_surface_desc *src = &surfaces[i];
+
+    if (src->texture == QR_INVALID_HANDLE ||
+        src->texture > ctx->texture_count ||
+        src->lightmap == QR_INVALID_HANDLE ||
+        src->lightmap > ctx->lightmap_count) {
+      return QR_ERROR_INVALID_ARGUMENT;
+    }
+  }
+
+  first_surface = ctx->surface_count;
+  for (i = 0U; i < surface_count; ++i) {
+    const qr_world_surface_desc *src = &surfaces[i];
+    qr_surface_record *record = &dst[(size_t)first_surface + i];
+
+    record->texture = src->texture;
+    record->lightmap = src->lightmap;
+    record->flags = src->flags;
+    memcpy(record->plane, src->plane, sizeof(record->plane));
+    memcpy(record->tex_s, src->tex_s, sizeof(record->tex_s));
+    memcpy(record->tex_t, src->tex_t, sizeof(record->tex_t));
+    memcpy(record->light_s, src->light_s, sizeof(record->light_s));
+    memcpy(record->light_t, src->light_t, sizeof(record->light_t));
+  }
+
+  ++ctx->world_count;
+  ctx->worlds[ctx->world_count].first_surface = first_surface;
+  ctx->worlds[ctx->world_count].surface_count = (uint32_t)surface_count;
+  ctx->surface_count += (uint32_t)surface_count;
+  *out = ctx->world_count;
+  return QR_SUCCESS;
+}
+
+qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out)
+{
+  if (ctx == NULL || out == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  out->texture_count = ctx->texture_count;
+  out->texture_capacity = ctx->texture_capacity;
+  out->texture_atlas_used = ctx->texture_atlas_used;
+  out->texture_atlas_capacity = ctx->texture_atlas_bytes;
+  out->lightmap_count = ctx->lightmap_count;
+  out->lightmap_capacity = ctx->lightmap_capacity;
+  out->lightmap_atlas_used = ctx->lightmap_atlas_used;
+  out->lightmap_atlas_capacity = ctx->lightmap_atlas_bytes;
+  out->surface_count = ctx->surface_count;
+  out->surface_capacity = ctx->surface_capacity;
+  out->world_count = ctx->world_count;
+  out->world_capacity = ctx->world_capacity;
   return QR_SUCCESS;
 }
