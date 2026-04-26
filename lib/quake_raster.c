@@ -2169,6 +2169,46 @@ qr_result qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
   return QR_SUCCESS;
 }
 
+qr_result qr_read_depth(qr_context *ctx, float *dst, size_t dst_size,
+                        size_t dst_stride)
+{
+  const float *src_row;
+  float *dst_row;
+  size_t required_pixels;
+  size_t required_bytes;
+  size_t stride;
+  uint32_t y;
+  int err;
+
+  if (ctx == NULL || dst == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  stride = dst_stride != 0U ? dst_stride : (size_t)ctx->width;
+  err = qr_indexed_read_size(ctx->width, ctx->height, stride,
+                             &required_pixels);
+  if (err != 0) {
+    return qr_result_from_errno(err);
+  }
+  if (required_pixels > SIZE_MAX / sizeof(float)) {
+    return QR_ERROR_OVERFLOW;
+  }
+  required_bytes = required_pixels * sizeof(float);
+  if (dst_size < required_bytes) {
+    return QR_ERROR_BUFFER_TOO_SMALL;
+  }
+  src_row = (const float *)kfd_gpu_buffer_cpu(ctx->depth);
+  if (src_row == NULL) {
+    return QR_ERROR_IO;
+  }
+  dst_row = dst;
+  for (y = 0U; y < ctx->height; ++y) {
+    memcpy(dst_row, src_row, (size_t)ctx->width * sizeof(float));
+    src_row += ctx->width;
+    dst_row += stride;
+  }
+  return QR_SUCCESS;
+}
+
 qr_result qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
                        size_t dst_size, size_t dst_stride_pixels)
 {
