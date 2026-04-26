@@ -77,13 +77,30 @@ static unsigned qr_clamp_coord(float value, unsigned limit)
   return (unsigned)coord;
 }
 
+static unsigned qr_wrap_coord(float value, unsigned limit)
+{
+  int coord;
+  int signed_limit;
+
+  if (limit == 0U) {
+    return 0U;
+  }
+  coord = (int)value;
+  signed_limit = (int)limit;
+  coord %= signed_limit;
+  if (coord < 0) {
+    coord += signed_limit;
+  }
+  return (unsigned)coord;
+}
+
 static unsigned char qr_sample_texture(struct QrTextureRecord *texture,
                                        unsigned char *atlas, float u, float v)
 {
   unsigned width = texture->width[0];
   unsigned height = texture->height[0];
-  unsigned x = qr_clamp_coord(u, width);
-  unsigned y = qr_clamp_coord(v, height);
+  unsigned x = qr_wrap_coord(u, width);
+  unsigned y = qr_wrap_coord(v, height);
 
   return atlas[texture->mip_offset[0] + y * width + x];
 }

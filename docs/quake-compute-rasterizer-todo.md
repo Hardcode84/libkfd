@@ -94,7 +94,7 @@ Exit criteria:
 - [x] Apply classic colormap rule.
 - [x] Add depth buffer.
 - [x] Add visual debug modes: flat surface ID, depth, texture only, light only.
-- [ ] Validate recognizable `e1m1` nooutput dump through the QrustyQuake
+- [x] Validate recognizable `e1m1` nooutput dump through the QrustyQuake
   adapter.
 
 Exit criteria:
