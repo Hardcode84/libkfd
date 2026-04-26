@@ -146,11 +146,11 @@ Exit criteria:
 
 ## Milestone 9: Classic Surface Types
 
-- [ ] Sky path.
-- [ ] Water/turbulence path.
-- [ ] Transparent index/cutout handling.
-- [ ] Animated light styles.
-- [ ] Dirty dynamic lightmap updates.
+- [x] Sky path.
+- [x] Water/turbulence path.
+- [x] Transparent index/cutout handling.
+- [x] Animated light styles.
+- [x] Dirty dynamic lightmap updates.
 
 Exit criteria:
 

@@ -101,6 +101,7 @@ typedef struct qr_world_raster_args {
   uint32_t height;
   uint32_t triangle_count;
   uint32_t debug_mode;
+  float time_seconds;
   uint32_t *tile_indices;
   uint32_t *tile_counts;
   uint32_t *tile_overflows;
@@ -1582,6 +1583,7 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
   args->triangles = (qr_raster_triangle *)kfd_gpu_buffer_gpu(triangle_buffer);
   args->triangle_count = (uint32_t)triangle_count;
   args->debug_mode = (uint32_t)desc->debug_mode;
+  args->time_seconds = desc->time_seconds;
 
   bin_args = (qr_tile_bin_args *)kfd_gpu_buffer_cpu(ctx->tile_bin_root);
   if (bin_args == NULL) {
@@ -1940,6 +1942,34 @@ qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
   ctx->lightmaps[ctx->lightmap_count] = record;
   ctx->lightmap_atlas_used += bytes;
   *out = ctx->lightmap_count;
+  return QR_SUCCESS;
+}
+
+qr_result qr_update_lightmap(qr_context *ctx, qr_lightmap lightmap,
+                             const qr_lightmap_desc *desc)
+{
+  qr_lightmap_record *record;
+  uint8_t *atlas;
+  int err;
+
+  if (ctx == NULL || desc == NULL || lightmap == QR_INVALID_HANDLE ||
+      lightmap > ctx->lightmap_count || desc->pixels == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  record = &ctx->lightmaps[lightmap];
+  if (desc->width != record->width || desc->height != record->height) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  atlas = (uint8_t *)kfd_gpu_buffer_cpu(ctx->lightmap_atlas);
+  if (atlas == NULL) {
+    return QR_ERROR_IO;
+  }
+  err = qr_copy_indexed_rect(atlas, record->offset, ctx->lightmap_atlas_bytes,
+                             desc->pixels, desc->width, desc->height,
+                             desc->stride);
+  if (err != 0) {
+    return qr_result_from_errno(err);
+  }
   return QR_SUCCESS;
 }
 

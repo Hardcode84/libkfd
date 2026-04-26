@@ -19,7 +19,7 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 5U
+#define QR_API_VERSION_MINOR 6U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
@@ -27,6 +27,10 @@ typedef struct qr_frame qr_frame;
 #define QR_TILE_SIZE 16U
 #define QR_TILE_TRIANGLE_CAPACITY 256U
 #define QR_DEPTH_KEY_SCALE 4096U
+#define QR_SURFACE_SKY 4U
+#define QR_SURFACE_TURBULENT 0x10U
+#define QR_SURFACE_CUTOUT 0x80U
+#define QR_SKY_COLOR_INDEX 109U
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -145,6 +149,7 @@ typedef struct qr_world_draw_desc {
   const uint8_t *colormap;
   size_t colormap_size;
   qr_debug_mode debug_mode;
+  float time_seconds;
 } qr_world_draw_desc;
 
 typedef struct qr_capacity_info {
@@ -245,6 +250,8 @@ qr_result qr_upload_texture(qr_context *ctx, const qr_texture_desc *desc,
                             qr_texture *out);
 qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
                              qr_lightmap *out);
+qr_result qr_update_lightmap(qr_context *ctx, qr_lightmap lightmap,
+                             const qr_lightmap_desc *desc);
 qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
                           size_t surface_count, qr_world *out);
 qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);

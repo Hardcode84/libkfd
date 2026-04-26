@@ -2,6 +2,10 @@
 
 #define QR_DEPTH_KEY_SCALE 4096U
 #define QR_DEPTH_KEY_MAX 4294967295U
+#define QR_SURFACE_SKY 4U
+#define QR_SURFACE_TURBULENT 0x10U
+#define QR_SURFACE_CUTOUT 0x80U
+#define QR_SKY_COLOR_INDEX 109U
 
 struct QrRasterVertex {
   float x;
@@ -59,6 +63,7 @@ struct QrWorldRasterArgs {
   unsigned height;
   unsigned triangle_count;
   unsigned debug_mode;
+  float time_seconds;
   unsigned *tile_indices;
   unsigned *tile_counts;
   unsigned *tile_overflows;
@@ -157,6 +162,10 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   struct QrSurfaceRecord *surface;
   struct QrTextureRecord *texture;
   struct QrLightmapRecord *lightmap;
+  float u;
+  float v;
+  float light_u;
+  float light_v;
   unsigned char texel;
   unsigned char light;
   unsigned char color;
@@ -187,20 +196,31 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   }
 
   surface = &args->surfaces[triangle->surface];
+  if ((surface->flags & QR_SURFACE_SKY) != 0U) {
+    *best_depth = depth;
+    *best_depth_key = depth_key;
+    *best_color = (unsigned char)QR_SKY_COLOR_INDEX;
+    return;
+  }
   texture = &args->textures[surface->texture];
   lightmap = &args->lightmaps[surface->lightmap];
-  texel = qr_sample_texture(texture, args->texture_atlas,
-                            w0 * triangle->v0.u + w1 * triangle->v1.u +
-                                w2 * triangle->v2.u,
-                            w0 * triangle->v0.v + w1 * triangle->v1.v +
-                                w2 * triangle->v2.v);
-  light = qr_sample_lightmap(lightmap, args->lightmap_atlas,
-                             w0 * triangle->v0.light_u +
-                                 w1 * triangle->v1.light_u +
-                                 w2 * triangle->v2.light_u,
-                             w0 * triangle->v0.light_v +
-                                 w1 * triangle->v1.light_v +
-                                 w2 * triangle->v2.light_v);
+  u = w0 * triangle->v0.u + w1 * triangle->v1.u + w2 * triangle->v2.u;
+  v = w0 * triangle->v0.v + w1 * triangle->v1.v + w2 * triangle->v2.v;
+  light_u = w0 * triangle->v0.light_u + w1 * triangle->v1.light_u +
+            w2 * triangle->v2.light_u;
+  light_v = w0 * triangle->v0.light_v + w1 * triangle->v1.light_v +
+            w2 * triangle->v2.light_v;
+  if ((surface->flags & QR_SURFACE_TURBULENT) != 0U) {
+    int wobble = ((int)(px + py + args->time_seconds * 16.0f) & 3) - 1;
+
+    u += (float)wobble;
+    v -= (float)wobble;
+  }
+  texel = qr_sample_texture(texture, args->texture_atlas, u, v);
+  if ((surface->flags & QR_SURFACE_CUTOUT) != 0U && texel == 255U) {
+    return;
+  }
+  light = qr_sample_lightmap(lightmap, args->lightmap_atlas, light_u, light_v);
 
   if (args->debug_mode == 1U) {
     color = (unsigned char)((triangle->surface + 1U) & 0xffU);
