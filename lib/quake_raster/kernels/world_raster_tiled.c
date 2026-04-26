@@ -126,6 +126,18 @@ static unsigned char qr_sample_texture(struct QrTextureRecord *texture,
   return atlas[texture->mip_offset[0] + y * width + x];
 }
 
+static unsigned char qr_sample_texture_clamped(struct QrTextureRecord *texture,
+                                               unsigned char *atlas, float u,
+                                               float v)
+{
+  unsigned width = texture->width[0];
+  unsigned height = texture->height[0];
+  unsigned x = qr_clamp_coord(u, width);
+  unsigned y = qr_clamp_coord(v, height);
+
+  return atlas[texture->mip_offset[0] + y * width + x];
+}
+
 static unsigned char qr_sample_lightmap(struct QrLightmapRecord *lightmap,
                                         unsigned char *atlas, float u, float v)
 {
@@ -254,7 +266,16 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
     u += (float)wobble;
     v -= (float)wobble;
   }
-  texel = qr_sample_texture(texture, args->texture_atlas, u, v);
+  if ((triangle->flags & 1U) != 0U) {
+    if ((surface->flags & QR_SURFACE_CUTOUT) != 0U &&
+        (u < 0.0f || v < 0.0f || u >= (float)texture->width[0] ||
+         v >= (float)texture->height[0])) {
+      return;
+    }
+    texel = qr_sample_texture_clamped(texture, args->texture_atlas, u, v);
+  } else {
+    texel = qr_sample_texture(texture, args->texture_atlas, u, v);
+  }
   if ((surface->flags & QR_SURFACE_CUTOUT) != 0U && texel == 255U) {
     return;
   }
