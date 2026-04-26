@@ -84,6 +84,18 @@ static float qr_edge(float ax, float ay, float bx, float by, float px, float py)
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
 }
 
+static float qr_min3(float a, float b, float c)
+{
+  float out = a < b ? a : b;
+  return out < c ? out : c;
+}
+
+static float qr_max3(float a, float b, float c)
+{
+  float out = a > b ? a : b;
+  return out > c ? out : c;
+}
+
 static int qr_finite(float value)
 {
   return value == value && value <= 3.402823466e38f &&
@@ -197,6 +209,10 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   float v;
   float light_u;
   float light_v;
+  float min_x;
+  float max_x;
+  float min_y;
+  float max_y;
   unsigned char texel;
   unsigned char light;
   unsigned char color;
@@ -209,6 +225,14 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
     return;
   }
   if (area > -0.00001f && area < 0.00001f) {
+    return;
+  }
+  min_x = qr_min3(triangle->v0.x, triangle->v1.x, triangle->v2.x);
+  max_x = qr_max3(triangle->v0.x, triangle->v1.x, triangle->v2.x);
+  min_y = qr_min3(triangle->v0.y, triangle->v1.y, triangle->v2.y);
+  max_y = qr_max3(triangle->v0.y, triangle->v1.y, triangle->v2.y);
+  if (px < min_x - 0.5f || px > max_x + 0.5f || py < min_y - 0.5f ||
+      py > max_y + 0.5f) {
     return;
   }
 
@@ -347,7 +371,6 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
 
   pixel = y * args->width + x;
   tile = (y / 16U) * args->tile_cols + (x / 16U);
-  count = args->tile_counts[tile];
   px = (float)x + 0.5f;
   py = (float)y + 0.5f;
   best_depth = args->preserve_depth != 0U ? args->depth[pixel]
@@ -358,28 +381,31 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
   order_disagreement = 0U;
   hit = 0U;
 
-  if (args->tile_overflows[tile] != 0U) {
+  if (args->preserve_depth != 0U) {
     for (i = 0U; i < args->triangle_count; ++i) {
       qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
                            &best_depth_key, &best_color, &order_disagreement,
                            &hit);
-      if (args->debug_mode != 5U &&
-          best_depth_key < args->tile_depth_min[tile]) {
+    }
+  } else if (args->tile_overflows[tile] != 0U) {
+    for (i = 0U; i < args->triangle_count; ++i) {
+      qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
+                           &best_depth_key, &best_color, &order_disagreement,
+                           &hit);
+      if (args->debug_mode != 5U && best_depth_key < args->tile_depth_min[tile])
         break;
-      }
     }
   } else {
     unsigned base = tile * args->tile_triangle_capacity;
 
+    count = args->tile_counts[tile];
     for (i = 0U; i < count; ++i) {
       unsigned triangle_index = args->tile_indices[base + i];
       qr_consider_triangle(args, &args->triangles[triangle_index], px, py,
                            &best_depth, &best_depth_key, &best_color,
                            &order_disagreement, &hit);
-      if (args->debug_mode != 5U &&
-          best_depth_key < args->tile_depth_min[tile]) {
+      if (args->debug_mode != 5U && best_depth_key < args->tile_depth_min[tile])
         break;
-      }
     }
   }
 

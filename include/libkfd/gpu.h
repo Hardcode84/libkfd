@@ -120,6 +120,7 @@ int kfd_gpu_copy(kfd_gpu_context *ctx, void *dst_gpu, const void *src_gpu,
                  size_t bytes);
 int kfd_gpu_fill32(kfd_gpu_context *ctx, void *dst_gpu, kfd_gpu_u32 value,
                    kfd_gpu_u32 bytes);
+int kfd_gpu_acquire_mem(kfd_gpu_context *ctx);
 int kfd_gpu_dispatch(kfd_gpu_context *ctx, kfd_gpu_kernel *kernel,
                      const kfd_gpu_dispatch_config *cfg, kfd_gpu_buffer *args,
                      kfd_gpu_fence *completion);

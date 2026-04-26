@@ -487,6 +487,13 @@ extern "C" int kfd_gpu_fill32(kfd_gpu_context *ctx, void *dst_gpu,
   return r ? clear_error() : set_error(r.error());
 }
 
+extern "C" int kfd_gpu_acquire_mem(kfd_gpu_context *ctx) {
+  if (!ctx)
+    return set_error(EINVAL, "invalid acquire_mem argument");
+  auto r = ctx->compute.acquire_mem();
+  return r ? clear_error() : set_error(r.error());
+}
+
 extern "C" int kfd_gpu_dispatch(kfd_gpu_context *ctx, kfd_gpu_kernel *kernel,
                                 const kfd_gpu_dispatch_config *cfg,
                                 kfd_gpu_buffer *args,
