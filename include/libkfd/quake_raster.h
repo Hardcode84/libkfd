@@ -19,10 +19,11 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 1U
+#define QR_API_VERSION_MINOR 2U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
+#define QR_COLORMAP_SIZE (256U * 256U)
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -47,6 +48,14 @@ typedef enum qr_output_mode {
 typedef enum qr_framebuffer_format {
   QR_FRAMEBUFFER_INDEXED8 = 0
 } qr_framebuffer_format;
+
+typedef enum qr_debug_mode {
+  QR_DEBUG_SHADED = 0,
+  QR_DEBUG_FLAT_SURFACE_ID,
+  QR_DEBUG_DEPTH,
+  QR_DEBUG_TEXTURE_ONLY,
+  QR_DEBUG_LIGHT_ONLY
+} qr_debug_mode;
 
 typedef uint32_t qr_texture;
 typedef uint32_t qr_lightmap;
@@ -102,6 +111,31 @@ typedef struct qr_world_surface_desc {
   float light_t[4];
 } qr_world_surface_desc;
 
+typedef struct qr_world_vertex {
+  float x;
+  float y;
+  float z;
+  float u;
+  float v;
+  float light_u;
+  float light_v;
+} qr_world_vertex;
+
+typedef struct qr_world_polygon_desc {
+  uint32_t surface;
+  const qr_world_vertex *vertices;
+  uint32_t vertex_count;
+} qr_world_polygon_desc;
+
+typedef struct qr_world_draw_desc {
+  qr_world world;
+  const qr_world_polygon_desc *polygons;
+  size_t polygon_count;
+  const uint8_t *colormap;
+  size_t colormap_size;
+  qr_debug_mode debug_mode;
+} qr_world_draw_desc;
+
 typedef struct qr_capacity_info {
   uint32_t texture_count;
   uint32_t texture_capacity;
@@ -140,10 +174,18 @@ qr_output_mode qr_output(const qr_context *ctx);
  * Frame handles are borrowed from their parent context and stay valid until
  * qr_end_frame(). The current implementation executes clear/resolve work
  * synchronously before returning from the API that submits it.
+ *
+ * qr_frame_draw_world() takes screen-space polygon vertices. The CPU setup path
+ * triangulates each polygon as a fan, uploads that transient command list, then
+ * the GPU raster pass draws opaque surfaces with nearest texture/lightmap
+ * sampling. In shaded mode, colormap must point at QR_COLORMAP_SIZE bytes using
+ * light*256 + texel indexing. Submit the full visible opaque world batch in one
+ * call; the MVP raster pass rebuilds its depth state for that submitted batch.
  */
 qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
                          qr_frame **out);
 qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color);
+qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc);
 qr_result qr_end_frame(qr_frame *frame);
 
 /*

@@ -86,14 +86,16 @@ Exit criteria:
 
 ## Milestone 5: Minimal World Raster
 
-- [ ] Add CPU or GPU setup path for visible world polygons.
-- [ ] Add first world raster kernel without tile binning if simpler.
-- [ ] Raster opaque world surfaces into indexed framebuffer.
-- [ ] Sample texture atlas with nearest filtering.
-- [ ] Sample static lightmap atlas.
-- [ ] Apply classic colormap rule.
-- [ ] Add depth buffer.
-- [ ] Add visual debug modes: flat surface ID, depth, texture only, light only.
+- [x] Add CPU or GPU setup path for visible world polygons.
+- [x] Add first world raster kernel without tile binning if simpler.
+- [x] Raster opaque world surfaces into indexed framebuffer.
+- [x] Sample texture atlas with nearest filtering.
+- [x] Sample static lightmap atlas.
+- [x] Apply classic colormap rule.
+- [x] Add depth buffer.
+- [x] Add visual debug modes: flat surface ID, depth, texture only, light only.
+- [ ] Validate recognizable `e1m1` nooutput dump through the QrustyQuake
+  adapter.
 
 Exit criteria:
 

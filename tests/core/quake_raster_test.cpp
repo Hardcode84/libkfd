@@ -371,3 +371,183 @@ TEST_CASE("Quake raster - resource uploads reject undersized atlases",
 
   qr_destroy(ctx);
 }
+
+TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 4;
+  constexpr std::uint32_t HEIGHT = 4;
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 2,
+      .max_lightmaps = 2,
+      .max_surfaces = 2,
+      .max_worlds = 1,
+      .texture_atlas_bytes = 32,
+      .lightmap_atlas_bytes = 32,
+  };
+  const std::array<std::uint8_t, WIDTH * HEIGHT> far_texture{
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  const std::array<std::uint8_t, WIDTH * HEIGHT> near_texture{
+      90, 90, 90, 90, 90, 90, 90, 90,
+      90, 90, 90, 90, 90, 90, 90, 90};
+  const std::array<std::uint8_t, WIDTH * HEIGHT> far_light{
+      10, 10, 10, 10, 10, 10, 10, 10,
+      10, 10, 10, 10, 10, 10, 10, 10};
+  const std::array<std::uint8_t, WIDTH * HEIGHT> near_light{
+      200, 200, 200, 200, 200, 200, 200, 200,
+      200, 200, 200, 200, 200, 200, 200, 200};
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture far_tex = QR_INVALID_HANDLE;
+  qr_texture near_tex = QR_INVALID_HANDLE;
+  qr_lightmap far_lm = QR_INVALID_HANDLE;
+  qr_lightmap near_lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc far_tex_desc{
+      .mips =
+          {
+              {.pixels = far_texture.data(), .width = WIDTH, .height = HEIGHT,
+               .stride = WIDTH},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_texture_desc near_tex_desc{
+      .mips =
+          {
+              {.pixels = near_texture.data(), .width = WIDTH, .height = HEIGHT,
+               .stride = WIDTH},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc far_lm_desc{
+      .pixels = far_light.data(),
+      .width = WIDTH,
+      .height = HEIGHT,
+      .stride = WIDTH,
+  };
+  qr_lightmap_desc near_lm_desc{
+      .pixels = near_light.data(),
+      .width = WIDTH,
+      .height = HEIGHT,
+      .stride = WIDTH,
+  };
+  std::array<qr_world_surface_desc, 2> surfaces{};
+  std::array<qr_world_vertex, 4> far_quad{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.5F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 0.0F, .z = 0.5F, .u = 4.0F, .v = 0.0F,
+       .light_u = 4.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 4.0F, .z = 0.5F, .u = 4.0F, .v = 4.0F,
+       .light_u = 4.0F, .light_v = 4.0F},
+      {.x = 0.0F, .y = 4.0F, .z = 0.5F, .u = 0.0F, .v = 4.0F,
+       .light_u = 0.0F, .light_v = 4.0F},
+  }};
+  std::array<qr_world_vertex, 4> near_quad{{
+      {.x = 1.0F, .y = 1.0F, .z = 0.1F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 3.0F, .y = 1.0F, .z = 0.1F, .u = 4.0F, .v = 0.0F,
+       .light_u = 4.0F, .light_v = 0.0F},
+      {.x = 3.0F, .y = 3.0F, .z = 0.1F, .u = 4.0F, .v = 4.0F,
+       .light_u = 4.0F, .light_v = 4.0F},
+      {.x = 1.0F, .y = 3.0F, .z = 0.1F, .u = 0.0F, .v = 4.0F,
+       .light_u = 0.0F, .light_v = 4.0F},
+  }};
+  std::array<qr_world_polygon_desc, 2> polygons{{
+      {.surface = 0, .vertices = far_quad.data(),
+       .vertex_count = static_cast<std::uint32_t>(far_quad.size())},
+      {.surface = 1, .vertices = near_quad.data(),
+       .vertex_count = static_cast<std::uint32_t>(near_quad.size())},
+  }};
+  std::array<std::uint8_t, QR_COLORMAP_SIZE> colormap{};
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+
+  for (std::uint32_t light = 0; light < 256; ++light) {
+    for (std::uint32_t texel = 0; texel < 256; ++texel) {
+      colormap[(light << 8U) | texel] =
+          static_cast<std::uint8_t>((light + texel) & 0xffU);
+    }
+  }
+
+  REQUIRE(qr_upload_texture(ctx, &far_tex_desc, &far_tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_texture(ctx, &near_tex_desc, &near_tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &far_lm_desc, &far_lm) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &near_lm_desc, &near_lm) == QR_SUCCESS);
+  surfaces[0].texture = far_tex;
+  surfaces[0].lightmap = far_lm;
+  surfaces[1].texture = near_tex;
+  surfaces[1].lightmap = near_lm;
+  REQUIRE(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+          QR_SUCCESS);
+
+  auto render_mode = [&](qr_debug_mode mode) {
+    qr_frame *frame = nullptr;
+    qr_frame_desc frame_desc{};
+    qr_world_draw_desc draw_desc{
+        .world = world,
+        .polygons = polygons.data(),
+        .polygon_count = polygons.size(),
+        .colormap = colormap.data(),
+        .colormap_size = colormap.size(),
+        .debug_mode = mode,
+    };
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_world(frame, &draw_desc) == QR_SUCCESS);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+    REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+            QR_SUCCESS);
+  };
+
+  render_mode(QR_DEBUG_TEXTURE_ONLY);
+  CHECK(pixels[0] == 0);
+  CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 90);
+
+  render_mode(QR_DEBUG_FLAT_SURFACE_ID);
+  CHECK(pixels[0] == 1);
+  CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 2);
+
+  render_mode(QR_DEBUG_LIGHT_ONLY);
+  CHECK(pixels[0] == 10);
+  CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 200);
+
+  render_mode(QR_DEBUG_SHADED);
+  CHECK(pixels[0] == ((10 + 0) & 0xff));
+  CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] ==
+        ((200 + 90) & 0xff));
+
+  render_mode(QR_DEBUG_DEPTH);
+  CHECK(pixels[0] == 239);
+  CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 252);
+
+  {
+    qr_frame *frame = nullptr;
+    qr_frame_desc frame_desc{};
+    qr_world_draw_desc bad_draw{
+        .world = world,
+        .polygons = polygons.data(),
+        .polygon_count = polygons.size(),
+        .debug_mode = QR_DEBUG_SHADED,
+    };
+    std::array<qr_world_polygon_desc, 1> bad_polygons{{
+        {.surface = 99, .vertices = far_quad.data(),
+         .vertex_count = static_cast<std::uint32_t>(far_quad.size())},
+    }};
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
+    bad_draw.colormap = colormap.data();
+    bad_draw.colormap_size = colormap.size();
+    bad_draw.polygons = bad_polygons.data();
+    bad_draw.polygon_count = bad_polygons.size();
+    CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  }
+
+  qr_destroy(ctx);
+}
