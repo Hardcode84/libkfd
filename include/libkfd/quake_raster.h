@@ -31,6 +31,7 @@ typedef struct qr_frame qr_frame;
 #define QR_SURFACE_TURBULENT 0x10U
 #define QR_SURFACE_CUTOUT 0x80U
 #define QR_SKY_COLOR_INDEX 109U
+#define QR_OVERLAY_TRIANGLE_AFFINE 1U
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -160,6 +161,32 @@ typedef struct qr_world_draw_desc {
   qr_debug_mode debug_mode;
   float time_seconds;
 } qr_world_draw_desc;
+
+typedef struct qr_overlay_triangle_desc {
+  /*
+   * If texture and lightmap are QR_INVALID_HANDLE, surface is interpreted
+   * relative to world. Otherwise texture/lightmap/flags describe a transient
+   * overlay material for this triangle.
+   */
+  uint32_t surface;
+  qr_texture texture;
+  qr_lightmap lightmap;
+  uint32_t flags;
+  uint32_t triangle_flags;
+  qr_world_vertex v0;
+  qr_world_vertex v1;
+  qr_world_vertex v2;
+} qr_overlay_triangle_desc;
+
+typedef struct qr_overlay_draw_desc {
+  qr_world world;
+  const qr_overlay_triangle_desc *triangles;
+  size_t triangle_count;
+  const uint8_t *colormap;
+  size_t colormap_size;
+  qr_debug_mode debug_mode;
+  float time_seconds;
+} qr_overlay_draw_desc;
 
 typedef struct qr_alias_triangle_desc {
   uint32_t surface;
@@ -318,6 +345,8 @@ qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
                          qr_frame **out);
 qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color);
 qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc);
+qr_result qr_frame_draw_overlay(qr_frame *frame,
+                                const qr_overlay_draw_desc *desc);
 qr_result qr_frame_draw_alias_model(qr_frame *frame,
                                     const qr_alias_draw_desc *desc);
 qr_result qr_frame_draw_sprite(qr_frame *frame,

@@ -63,6 +63,7 @@ typedef struct qr_raster_triangle {
   qr_raster_vertex v1;
   qr_raster_vertex v2;
   uint32_t surface;
+  uint32_t flags;
 } qr_raster_triangle;
 
 typedef struct qr_texture_record {
@@ -131,6 +132,7 @@ typedef struct qr_world_raster_args {
   uint32_t tile_cols;
   uint32_t tile_rows;
   uint32_t tile_triangle_capacity;
+  uint32_t preserve_depth;
 } qr_world_raster_args;
 
 typedef struct qr_tile_bin_args {
@@ -156,7 +158,7 @@ typedef char qr_assert_raster_vertex_abi_size
     [(sizeof(qr_raster_vertex) == 7U * sizeof(float)) ? 1 : -1];
 typedef char qr_assert_raster_triangle_abi_size
     [(sizeof(qr_raster_triangle) ==
-      (3U * sizeof(qr_raster_vertex)) + sizeof(uint32_t))
+      (3U * sizeof(qr_raster_vertex)) + (2U * sizeof(uint32_t)))
          ? 1
          : -1];
 typedef char qr_assert_texture_record_abi_size
@@ -269,6 +271,7 @@ struct qr_context {
   qr_perf_counters perf;
   struct qr_frame frame;
   int frame_active;
+  int frame_depth_valid;
 };
 
 static qr_result qr_result_from_code(int code, qr_result fallback)
@@ -1472,6 +1475,7 @@ qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
     return QR_ERROR_BUSY;
   }
   ctx->frame_active = 1;
+  ctx->frame_depth_valid = 0;
   *out = &ctx->frame;
   return QR_SUCCESS;
 }
@@ -1493,6 +1497,7 @@ qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color)
     return QR_ERROR_IO;
   }
   args->color = (uint32_t)color;
+  frame->ctx->frame_depth_valid = 0;
   start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(frame->ctx->gpu, frame->ctx->clear_kernel,
                          &frame->ctx->clear_dispatch,
@@ -1534,6 +1539,14 @@ static int qr_valid_world_vertex(const qr_world_vertex *vertex)
 }
 
 static int qr_valid_alias_triangle_desc(const qr_alias_triangle_desc *triangle)
+{
+  return triangle != NULL && qr_valid_world_vertex(&triangle->v0) &&
+         qr_valid_world_vertex(&triangle->v1) &&
+         qr_valid_world_vertex(&triangle->v2);
+}
+
+static int qr_valid_overlay_triangle_desc(
+    const qr_overlay_triangle_desc *triangle)
 {
   return triangle != NULL && qr_valid_world_vertex(&triangle->v0) &&
          qr_valid_world_vertex(&triangle->v1) &&
@@ -1698,6 +1711,7 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   args->triangle_count = (uint32_t)triangle_count;
   args->debug_mode = (uint32_t)debug_mode;
   args->time_seconds = time_seconds;
+  args->preserve_depth = ctx->frame_depth_valid != 0 ? 1U : 0U;
 
   bin_args = (qr_tile_bin_args *)kfd_gpu_buffer_cpu(ctx->tile_bin_root);
   if (bin_args == NULL) {
@@ -1750,6 +1764,7 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
     if (end_ns >= start_ns) {
       ctx->perf.raster_time_ns += end_ns - start_ns;
     }
+    ctx->frame_depth_valid = 1;
   }
   return qr_result_from_gpu_error(err);
 }
@@ -1827,11 +1842,97 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
       triangle->v1 = qr_make_raster_vertex(&polygon->vertices[j]);
       triangle->v2 = qr_make_raster_vertex(&polygon->vertices[j + 1U]);
       triangle->surface = world->first_surface + polygon->surface;
+      triangle->flags = 0U;
     }
   }
   return qr_dispatch_prepared_triangles(ctx, triangle_count, desc->colormap,
                                         desc->colormap_size, desc->debug_mode,
                                         desc->time_seconds);
+}
+
+qr_result qr_frame_draw_overlay(qr_frame *frame,
+                                const qr_overlay_draw_desc *desc)
+{
+  qr_context *ctx;
+  qr_world_record *world;
+  qr_surface_record *surfaces;
+  size_t transient_surface_count;
+  size_t i;
+
+  if (frame == NULL || frame->ctx == NULL || desc == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  ctx = frame->ctx;
+  if (ctx->frame_active == 0 || desc->world == QR_INVALID_HANDLE ||
+      desc->world > ctx->world_count ||
+      qr_valid_debug_mode(desc->debug_mode) == 0 ||
+      !isfinite(desc->time_seconds)) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  if (desc->debug_mode == QR_DEBUG_SHADED &&
+      (desc->colormap == NULL || desc->colormap_size < QR_COLORMAP_SIZE)) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  if (desc->triangle_count == 0U) {
+    qr_reset_raster_stats(ctx);
+    return QR_SUCCESS;
+  }
+  if (desc->triangles == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  if (desc->triangle_count > UINT32_MAX ||
+      desc->triangle_count > ctx->triangle_capacity ||
+      ctx->triangles == NULL) {
+    return QR_ERROR_NO_SPACE;
+  }
+  surfaces = (qr_surface_record *)kfd_gpu_buffer_cpu(ctx->surface_metadata);
+  if (surfaces == NULL) {
+    return QR_ERROR_IO;
+  }
+
+  world = &ctx->worlds[desc->world];
+  transient_surface_count = 0U;
+  for (i = 0U; i < desc->triangle_count; ++i) {
+    const qr_overlay_triangle_desc *src = &desc->triangles[i];
+    qr_raster_triangle *dst = &ctx->triangles[i];
+    int direct_material =
+        src->texture != QR_INVALID_HANDLE || src->lightmap != QR_INVALID_HANDLE;
+
+    if (qr_valid_overlay_triangle_desc(src) == 0) {
+      return QR_ERROR_INVALID_ARGUMENT;
+    }
+    if (direct_material != 0) {
+      qr_surface_record *surface;
+      if (src->texture == QR_INVALID_HANDLE ||
+          src->texture > ctx->texture_count ||
+          src->lightmap == QR_INVALID_HANDLE ||
+          src->lightmap > ctx->lightmap_count ||
+          ctx->surface_count > ctx->surface_capacity ||
+          transient_surface_count >=
+              (size_t)(ctx->surface_capacity - ctx->surface_count)) {
+        return QR_ERROR_INVALID_ARGUMENT;
+      }
+      surface = &surfaces[(size_t)ctx->surface_count + transient_surface_count];
+      memset(surface, 0, sizeof(*surface));
+      surface->texture = src->texture;
+      surface->lightmap = src->lightmap;
+      surface->flags = src->flags;
+      dst->surface = ctx->surface_count + (uint32_t)transient_surface_count;
+      ++transient_surface_count;
+    } else {
+      if (src->surface >= world->surface_count) {
+        return QR_ERROR_INVALID_ARGUMENT;
+      }
+      dst->surface = world->first_surface + src->surface;
+    }
+    dst->v0 = qr_make_raster_vertex(&src->v0);
+    dst->v1 = qr_make_raster_vertex(&src->v1);
+    dst->v2 = qr_make_raster_vertex(&src->v2);
+    dst->flags = src->triangle_flags;
+  }
+  return qr_dispatch_prepared_triangles(ctx, desc->triangle_count,
+                                        desc->colormap, desc->colormap_size,
+                                        desc->debug_mode, desc->time_seconds);
 }
 
 qr_result qr_frame_draw_alias_model(qr_frame *frame,
@@ -1865,6 +1966,7 @@ qr_result qr_frame_draw_alias_model(qr_frame *frame,
     dst->v1 = src->v1;
     dst->v2 = src->v2;
     dst->surface = world->first_surface + src->surface;
+    dst->flags = 0U;
   }
   return qr_dispatch_prepared_triangles(ctx, model->triangle_count,
                                         desc->colormap, desc->colormap_size,
@@ -1901,11 +2003,13 @@ qr_result qr_frame_draw_sprite(qr_frame *frame,
   ctx->triangles[0].v2 = (qr_raster_vertex){desc->x1, desc->y1, desc->z,
                                              desc->u1, desc->v1, 0.0f, 0.0f};
   ctx->triangles[0].surface = world->first_surface + desc->surface;
+  ctx->triangles[0].flags = 0U;
   ctx->triangles[1].v0 = ctx->triangles[0].v0;
   ctx->triangles[1].v1 = ctx->triangles[0].v2;
   ctx->triangles[1].v2 = (qr_raster_vertex){desc->x0, desc->y1, desc->z,
                                              desc->u0, desc->v1, 0.0f, 0.0f};
   ctx->triangles[1].surface = world->first_surface + desc->surface;
+  ctx->triangles[1].flags = 0U;
   return qr_dispatch_prepared_triangles(ctx, 2U, desc->colormap,
                                         desc->colormap_size, desc->debug_mode,
                                         desc->time_seconds);
@@ -1976,6 +2080,7 @@ qr_result qr_frame_draw_particles(qr_frame *frame,
         (qr_raster_vertex){x1, y1, particle->z, particle->u + 1.0f,
                            particle->v + 1.0f, 0.0f, 0.0f};
     ctx->triangles[out_index].surface = surface;
+    ctx->triangles[out_index].flags = 0U;
     ++out_index;
     ctx->triangles[out_index].v0 = ctx->triangles[out_index - 1U].v0;
     ctx->triangles[out_index].v1 = ctx->triangles[out_index - 1U].v2;
@@ -1983,6 +2088,7 @@ qr_result qr_frame_draw_particles(qr_frame *frame,
         (qr_raster_vertex){x0, y1, particle->z, particle->u,
                            particle->v + 1.0f, 0.0f, 0.0f};
     ctx->triangles[out_index].surface = surface;
+    ctx->triangles[out_index].flags = 0U;
     ++out_index;
   }
 

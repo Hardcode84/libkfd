@@ -25,6 +25,7 @@ struct QrRasterTriangle {
   struct QrRasterVertex v1;
   struct QrRasterVertex v2;
   unsigned surface;
+  unsigned flags;
 };
 
 struct QrTextureRecord {
@@ -75,6 +76,7 @@ struct QrWorldRasterArgs {
   unsigned tile_cols;
   unsigned tile_rows;
   unsigned tile_triangle_capacity;
+  unsigned preserve_depth;
 };
 
 static float qr_edge(float ax, float ay, float bx, float by, float px, float py)
@@ -156,7 +158,8 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
                                  float py, float *best_depth,
                                  unsigned *best_depth_key,
                                  unsigned char *best_color,
-                                 unsigned *order_disagreement)
+                                 unsigned *order_disagreement,
+                                 unsigned *hit)
 {
   float area = qr_edge(triangle->v0.x, triangle->v0.y, triangle->v1.x,
                        triangle->v1.y, triangle->v2.x, triangle->v2.y);
@@ -226,12 +229,17 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   }
   texture = &args->textures[surface->texture];
   lightmap = &args->lightmaps[surface->lightmap];
-  u = (w0 * triangle->v0.u * inv_z0 + w1 * triangle->v1.u * inv_z1 +
-       w2 * triangle->v2.u * inv_z2) /
-      inv_z;
-  v = (w0 * triangle->v0.v * inv_z0 + w1 * triangle->v1.v * inv_z1 +
-       w2 * triangle->v2.v * inv_z2) /
-      inv_z;
+  if ((triangle->flags & 1U) != 0U) {
+    u = w0 * triangle->v0.u + w1 * triangle->v1.u + w2 * triangle->v2.u;
+    v = w0 * triangle->v0.v + w1 * triangle->v1.v + w2 * triangle->v2.v;
+  } else {
+    u = (w0 * triangle->v0.u * inv_z0 + w1 * triangle->v1.u * inv_z1 +
+         w2 * triangle->v2.u * inv_z2) /
+        inv_z;
+    v = (w0 * triangle->v0.v * inv_z0 + w1 * triangle->v1.v * inv_z1 +
+         w2 * triangle->v2.v * inv_z2) /
+        inv_z;
+  }
   light_u = (w0 * triangle->v0.light_u * inv_z0 +
              w1 * triangle->v1.light_u * inv_z1 +
              w2 * triangle->v2.light_u * inv_z2) /
@@ -276,6 +284,7 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   *best_depth = depth;
   *best_depth_key = depth_key;
   *best_color = color;
+  *hit = 1U;
 }
 
 KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
@@ -291,6 +300,7 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
   unsigned best_depth_key;
   unsigned char best_color;
   unsigned order_disagreement;
+  unsigned hit;
   unsigned i;
 
   if (x >= args->width || y >= args->height) {
@@ -302,15 +312,19 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
   count = args->tile_counts[tile];
   px = (float)x + 0.5f;
   py = (float)y + 0.5f;
-  best_depth = 3.402823466e38f;
-  best_depth_key = QR_DEPTH_KEY_MAX;
+  best_depth = args->preserve_depth != 0U ? args->depth[pixel]
+                                          : 3.402823466e38f;
+  best_depth_key = args->preserve_depth != 0U ? qr_depth_key(best_depth)
+                                              : QR_DEPTH_KEY_MAX;
   best_color = args->dst[pixel];
   order_disagreement = 0U;
+  hit = 0U;
 
   if (args->tile_overflows[tile] != 0U) {
     for (i = 0U; i < args->triangle_count; ++i) {
       qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
-                           &best_depth_key, &best_color, &order_disagreement);
+                           &best_depth_key, &best_color, &order_disagreement,
+                           &hit);
       if (args->debug_mode != 5U &&
           best_depth_key < args->tile_depth_min[tile]) {
         break;
@@ -323,7 +337,7 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
       unsigned triangle_index = args->tile_indices[base + i];
       qr_consider_triangle(args, &args->triangles[triangle_index], px, py,
                            &best_depth, &best_depth_key, &best_color,
-                           &order_disagreement);
+                           &order_disagreement, &hit);
       if (args->debug_mode != 5U &&
           best_depth_key < args->tile_depth_min[tile]) {
         break;
@@ -333,6 +347,10 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
 
   if (args->debug_mode == 5U) {
     best_color = order_disagreement != 0U ? 255U : 0U;
+    hit = 1U;
+  }
+  if (args->preserve_depth != 0U && hit == 0U) {
+    return;
   }
   args->depth[pixel] = best_depth;
   args->dst[pixel] = best_color;

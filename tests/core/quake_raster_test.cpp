@@ -454,6 +454,152 @@ TEST_CASE("Quake raster - handles classic surface flags and light updates",
   qr_destroy(ctx);
 }
 
+TEST_CASE("Quake raster - overlays preserve world depth and color",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 8;
+  constexpr std::uint32_t HEIGHT = 8;
+  constexpr std::uint8_t CLEAR = 7;
+  constexpr std::uint8_t WORLD = 11;
+  constexpr std::uint8_t OVERLAY = 22;
+  const std::array<std::uint8_t, 1> world_tex{WORLD};
+  const std::array<std::uint8_t, 1> overlay_tex{OVERLAY};
+  const std::array<std::uint8_t, 1> cutout_tex{255};
+  const std::array<std::uint8_t, 1> light{0};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 3,
+      .max_lightmaps = 1,
+      .max_surfaces = 5,
+      .max_worlds = 1,
+      .texture_atlas_bytes = 3,
+      .lightmap_atlas_bytes = 1,
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture world_texture = QR_INVALID_HANDLE;
+  qr_texture overlay_texture = QR_INVALID_HANDLE;
+  qr_texture cutout_texture = QR_INVALID_HANDLE;
+  qr_lightmap lightmap = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc world_tex_desc{
+      .mips = {{.pixels = world_tex.data(), .width = 1, .height = 1,
+                .stride = 1}},
+      .mip_count = 1,
+  };
+  qr_texture_desc overlay_tex_desc{
+      .mips = {{.pixels = overlay_tex.data(), .width = 1, .height = 1,
+                .stride = 1}},
+      .mip_count = 1,
+  };
+  qr_texture_desc cutout_tex_desc{
+      .mips = {{.pixels = cutout_tex.data(), .width = 1, .height = 1,
+                .stride = 1}},
+      .mip_count = 1,
+  };
+  qr_lightmap_desc light_desc{
+      .pixels = light.data(),
+      .width = 1,
+      .height = 1,
+      .stride = 1,
+  };
+  std::array<qr_world_surface_desc, 3> surfaces{};
+  const std::array<qr_world_vertex, 4> world_quad{{
+      {.x = 0.0F, .y = 0.0F, .z = 2.0F},
+      {.x = 8.0F, .y = 0.0F, .z = 2.0F},
+      {.x = 8.0F, .y = 8.0F, .z = 2.0F},
+      {.x = 0.0F, .y = 8.0F, .z = 2.0F},
+  }};
+  qr_world_polygon_desc world_polygon{
+      .surface = 0,
+      .vertices = world_quad.data(),
+      .vertex_count = static_cast<std::uint32_t>(world_quad.size()),
+  };
+  std::array<qr_overlay_triangle_desc, 2> overlay_triangles{{
+      {.surface = 1,
+       .v0 = {.x = 2.0F, .y = 2.0F, .z = 1.0F},
+       .v1 = {.x = 6.0F, .y = 2.0F, .z = 1.0F},
+       .v2 = {.x = 6.0F, .y = 6.0F, .z = 1.0F}},
+      {.surface = 1,
+       .v0 = {.x = 2.0F, .y = 2.0F, .z = 1.0F},
+       .v1 = {.x = 6.0F, .y = 6.0F, .z = 1.0F},
+       .v2 = {.x = 2.0F, .y = 6.0F, .z = 1.0F}},
+  }};
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+
+  REQUIRE(qr_upload_texture(ctx, &world_tex_desc, &world_texture) ==
+          QR_SUCCESS);
+  REQUIRE(qr_upload_texture(ctx, &overlay_tex_desc, &overlay_texture) ==
+          QR_SUCCESS);
+  REQUIRE(qr_upload_texture(ctx, &cutout_tex_desc, &cutout_texture) ==
+          QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &light_desc, &lightmap) == QR_SUCCESS);
+  surfaces[0].texture = world_texture;
+  surfaces[0].lightmap = lightmap;
+  surfaces[1].texture = overlay_texture;
+  surfaces[1].lightmap = lightmap;
+  surfaces[2].texture = cutout_texture;
+  surfaces[2].lightmap = lightmap;
+  surfaces[2].flags = QR_SURFACE_CUTOUT;
+  REQUIRE(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+          QR_SUCCESS);
+
+  auto render_overlay = [&](std::uint32_t surface, float z,
+                            bool direct_material = false) {
+    qr_frame *frame = nullptr;
+    qr_frame_desc frame_desc{};
+    qr_world_draw_desc world_draw{
+        .world = world,
+        .polygons = &world_polygon,
+        .polygon_count = 1,
+        .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+    };
+    for (qr_overlay_triangle_desc &triangle : overlay_triangles) {
+      triangle.surface = surface;
+      triangle.texture = direct_material ? overlay_texture : QR_INVALID_HANDLE;
+      triangle.lightmap = direct_material ? lightmap : QR_INVALID_HANDLE;
+      triangle.flags = 0;
+      triangle.v0.z = z;
+      triangle.v1.z = z;
+      triangle.v2.z = z;
+    }
+    qr_overlay_draw_desc overlay_draw{
+        .world = world,
+        .triangles = overlay_triangles.data(),
+        .triangle_count = overlay_triangles.size(),
+        .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+    };
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    REQUIRE(qr_frame_clear_indexed(frame, CLEAR) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_world(frame, &world_draw) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_overlay(frame, &overlay_draw) == QR_SUCCESS);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+    REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+            QR_SUCCESS);
+  };
+
+  render_overlay(1, 4.0F);
+  CHECK(pixels[static_cast<std::size_t>(3) * WIDTH + 3U] == WORLD);
+  CHECK(pixels[0] == WORLD);
+
+  render_overlay(1, 1.0F);
+  CHECK(pixels[static_cast<std::size_t>(3) * WIDTH + 3U] == OVERLAY);
+  CHECK(pixels[0] == WORLD);
+
+  render_overlay(999U, 1.0F, true);
+  CHECK(pixels[static_cast<std::size_t>(3) * WIDTH + 3U] == OVERLAY);
+  CHECK(pixels[0] == WORLD);
+
+  render_overlay(2, 1.0F);
+  CHECK(pixels[static_cast<std::size_t>(3) * WIDTH + 3U] == WORLD);
+  CHECK(pixels[0] == WORLD);
+
+  qr_destroy(ctx);
+}
+
 TEST_CASE("Quake raster - draws alias models, sprites, and particles",
           "[quake_raster][device]") {
   constexpr std::uint32_t WIDTH = 8;

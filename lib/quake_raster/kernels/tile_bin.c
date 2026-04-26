@@ -20,6 +20,7 @@ struct QrRasterTriangle {
   struct QrRasterVertex v1;
   struct QrRasterVertex v2;
   unsigned surface;
+  unsigned flags;
 };
 
 struct QrTileBinArgs {
