@@ -1724,42 +1724,20 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   bin_args->triangle_count = (uint32_t)triangle_count;
 
   start_ns = qr_now_ns();
-  if (preserve_depth != 0U) {
-    err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
-                           &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
-                           ctx->tile_bin_fence);
-    if (err == 0) {
-      err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
-    }
-    if (err != 0) {
-      return qr_result_from_gpu_error(err);
-    }
-    qr_reset_raster_stats(ctx);
-    ctx->last_stats.triangle_count = (uint32_t)triangle_count;
-    ctx->last_stats.occupied_tile_count = ctx->tile_count;
-    ctx->last_stats.overflow_tile_count = ctx->tile_count;
-    if (triangle_count > UINT32_MAX / ctx->tile_count) {
-      ctx->last_stats.hiz_overflow_fallback_count = UINT32_MAX;
-    } else {
-      ctx->last_stats.hiz_overflow_fallback_count =
-          (uint32_t)triangle_count * ctx->tile_count;
-    }
-  } else {
-    err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
-                           &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
-                           ctx->tile_bin_fence);
-    if (err == 0) {
-      err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
-    }
-    if (err != 0) {
-      return qr_result_from_gpu_error(err);
-    }
-    {
-      qr_result stats_result =
-          qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
-      if (stats_result != QR_SUCCESS) {
-        return stats_result;
-      }
+  err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
+                         &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
+                         ctx->tile_bin_fence);
+  if (err == 0) {
+    err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
+  }
+  if (err != 0) {
+    return qr_result_from_gpu_error(err);
+  }
+  {
+    qr_result stats_result =
+        qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
+    if (stats_result != QR_SUCCESS) {
+      return stats_result;
     }
   }
   end_ns = qr_now_ns();

@@ -434,13 +434,7 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
   order_disagreement = 0U;
   hit = 0U;
 
-  if (args->preserve_depth != 0U) {
-    for (i = 0U; i < args->triangle_count; ++i) {
-      qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
-                           &best_depth_key, &best_color, &order_disagreement,
-                           &hit);
-    }
-  } else if (args->tile_overflows[tile] != 0U) {
+  if (args->tile_overflows[tile] != 0U) {
     for (i = 0U; i < args->triangle_count; ++i) {
       qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
                            &best_depth_key, &best_color, &order_disagreement,
