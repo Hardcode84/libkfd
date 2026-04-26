@@ -161,10 +161,59 @@ static unsigned char qr_sample_lightmap(struct QrLightmapRecord *lightmap,
 {
   unsigned width = lightmap->width;
   unsigned height = lightmap->height;
-  unsigned x = qr_clamp_coord(u, width);
-  unsigned y = qr_clamp_coord(v, height);
+  unsigned x0;
+  unsigned y0;
+  unsigned x1;
+  unsigned y1;
+  float fx;
+  float fy;
+  float c00;
+  float c10;
+  float c01;
+  float c11;
+  float top;
+  float bottom;
+  float value;
 
-  return atlas[lightmap->offset + y * width + x];
+  if (width == 0U || height == 0U) {
+    return 0U;
+  }
+  if (u <= 0.0f) {
+    x0 = 0U;
+    fx = 0.0f;
+  } else if (u >= (float)(width - 1U)) {
+    x0 = width - 1U;
+    fx = 0.0f;
+  } else {
+    x0 = (unsigned)u;
+    fx = u - (float)x0;
+  }
+  if (v <= 0.0f) {
+    y0 = 0U;
+    fy = 0.0f;
+  } else if (v >= (float)(height - 1U)) {
+    y0 = height - 1U;
+    fy = 0.0f;
+  } else {
+    y0 = (unsigned)v;
+    fy = v - (float)y0;
+  }
+  x1 = x0 + 1U < width ? x0 + 1U : x0;
+  y1 = y0 + 1U < height ? y0 + 1U : y0;
+  c00 = (float)atlas[lightmap->offset + y0 * width + x0];
+  c10 = (float)atlas[lightmap->offset + y0 * width + x1];
+  c01 = (float)atlas[lightmap->offset + y1 * width + x0];
+  c11 = (float)atlas[lightmap->offset + y1 * width + x1];
+  top = c00 + (c10 - c00) * fx;
+  bottom = c01 + (c11 - c01) * fx;
+  value = top + (bottom - top) * fy;
+  if (value <= 0.0f) {
+    return 0U;
+  }
+  if (value >= 255.0f) {
+    return 255U;
+  }
+  return (unsigned char)(value + 0.5f);
 }
 
 static unsigned qr_depth_key(float depth)
