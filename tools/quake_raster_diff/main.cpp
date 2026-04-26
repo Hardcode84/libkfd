@@ -13,22 +13,28 @@ namespace {
 
 constexpr std::uintmax_t MAX_COMPARE_BYTES = 1024ULL * 1024ULL * 1024ULL;
 
+void print_usage() {
+  std::cerr << "quake_raster_diff: usage: quake_raster_diff <expected.raw> "
+               "<actual.raw>\n";
+}
+
 bool read_file(const std::string &path, std::vector<std::uint8_t> &out) {
   std::error_code ec;
   const std::uintmax_t size = std::filesystem::file_size(path, ec);
   if (ec) {
-    std::cerr << "failed to stat " << path << ": " << ec.message() << '\n';
+    std::cerr << "quake_raster_diff: failed to stat " << path << ": "
+              << ec.message() << '\n';
     return false;
   }
   if (size > MAX_COMPARE_BYTES) {
-    std::cerr << "refusing to load " << path << " (" << size
-              << " bytes; max " << MAX_COMPARE_BYTES << ")\n";
+    std::cerr << "quake_raster_diff: refusing to load " << path << " ("
+              << size << " bytes; max " << MAX_COMPARE_BYTES << ")\n";
     return false;
   }
 
   std::ifstream file(path, std::ios::binary);
   if (!file.good()) {
-    std::cerr << "failed to open " << path << '\n';
+    std::cerr << "quake_raster_diff: failed to open " << path << '\n';
     return false;
   }
   out.reserve(static_cast<std::size_t>(size));
@@ -40,8 +46,13 @@ bool read_file(const std::string &path, std::vector<std::uint8_t> &out) {
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 2 &&
+      (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
+    print_usage();
+    return 0;
+  }
   if (argc != 3) {
-    std::cerr << "usage: quake_raster_diff <expected.raw> <actual.raw>\n";
+    print_usage();
     return 2;
   }
 

@@ -32,3 +32,28 @@ jobs:
 
       - name: Run host validation
         run: ctest --test-dir build/ci/tests/core -R "Quake raster API" --output-on-failure
+
+      - name: Smoke quake_raster_diff
+        run: |
+          printf '\001\002\003\004' > /tmp/qr_expected.raw
+          printf '\001\002\003\004' > /tmp/qr_actual.raw
+          build/ci/tools/quake_raster_diff/quake_raster_diff /tmp/qr_expected.raw /tmp/qr_actual.raw
+
+  device-quake-raster:
+    if: ${{ vars.LIBKFD_RUN_DEVICE_TESTS == '1' }}
+    runs-on: [self-hosted, linux, amdgpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/device -G Ninja \
+            -DCMAKE_C_COMPILER="${CC:-clang}" \
+            -DCMAKE_CXX_COMPILER="${CXX:-clang++}" \
+            -DLIBKFD_BUILD_TESTS=ON
+
+      - name: Build device raster tests
+        run: cmake --build build/device --target quake_raster_test
+
+      - name: Run device raster tests
+        run: ctest --test-dir build/device/tests/core -R "device/Quake raster" --output-on-failure

@@ -100,6 +100,7 @@ typedef struct qr_desc {
 } qr_desc;
 
 typedef struct qr_frame_desc {
+  /* Reserved for future per-frame flags; callers must initialize it to zero. */
   uint32_t reserved;
 } qr_frame_desc;
 

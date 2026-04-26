@@ -26,6 +26,7 @@
 #define QR_RASTER_BLOCK_X 8U
 #define QR_RASTER_BLOCK_Y 8U
 #define QR_TILE_BIN_BLOCK_X 64U
+#define QR_MAX_KERNEL_IMAGE_BYTES (64U * 1024U * 1024U)
 
 typedef struct qr_kernel_candidate {
   const char *path;
@@ -146,6 +147,23 @@ typedef struct qr_tile_bin_args {
   uint32_t tile_rows;
   uint32_t tile_triangle_capacity;
 } qr_tile_bin_args;
+
+/* Keep these in sync with the device kernel structs; see docs. */
+typedef char qr_assert_unsigned_abi_width[(sizeof(unsigned) == sizeof(uint32_t))
+                                              ? 1
+                                              : -1];
+typedef char qr_assert_raster_vertex_abi_size
+    [(sizeof(qr_raster_vertex) == 7U * sizeof(float)) ? 1 : -1];
+typedef char qr_assert_raster_triangle_abi_size
+    [(sizeof(qr_raster_triangle) ==
+      (3U * sizeof(qr_raster_vertex)) + sizeof(uint32_t))
+         ? 1
+         : -1];
+typedef char qr_assert_texture_record_abi_size
+    [(sizeof(qr_texture_record) ==
+      (3U * QR_TEXTURE_MIP_COUNT + 2U) * sizeof(uint32_t))
+         ? 1
+         : -1];
 
 static const qr_kernel_candidate qr_clear_indexed_kernels[] = {
 #include "quake_raster_clear_indexed_kernels.inc"
@@ -513,6 +531,10 @@ static int qr_read_file(const char *path, uint8_t **out_data, size_t *out_size)
   if (size <= 0L) {
     (void)fclose(file);
     return EIO;
+  }
+  if ((unsigned long)size > QR_MAX_KERNEL_IMAGE_BYTES) {
+    (void)fclose(file);
+    return EFBIG;
   }
   if (fseek(file, 0L, SEEK_SET) != 0) {
     err = errno != 0 ? errno : EIO;

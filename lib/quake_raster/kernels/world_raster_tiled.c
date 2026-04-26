@@ -6,7 +6,9 @@
 #define QR_SURFACE_TURBULENT 0x10U
 #define QR_SURFACE_CUTOUT 0x80U
 #define QR_SKY_COLOR_INDEX 109U
+#define QR_TEXTURE_MIP_COUNT 4U
 
+/* Device ABI: these structs and constants must match lib/quake_raster.c. */
 struct QrRasterVertex {
   float x;
   float y;
@@ -25,9 +27,9 @@ struct QrRasterTriangle {
 };
 
 struct QrTextureRecord {
-  unsigned mip_offset[4];
-  unsigned width[4];
-  unsigned height[4];
+  unsigned mip_offset[QR_TEXTURE_MIP_COUNT];
+  unsigned width[QR_TEXTURE_MIP_COUNT];
+  unsigned height[QR_TEXTURE_MIP_COUNT];
   unsigned mip_count;
   unsigned flags;
 };
@@ -136,6 +138,9 @@ static unsigned qr_depth_key(float depth)
 {
   float scaled = depth * (float)QR_DEPTH_KEY_SCALE;
 
+  if (!(depth == depth)) {
+    return QR_DEPTH_KEY_MAX;
+  }
   if (scaled <= 0.0f) {
     return 0U;
   }

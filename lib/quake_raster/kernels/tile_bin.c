@@ -4,6 +4,7 @@
 #define QR_DEPTH_KEY_SCALE 4096U
 #define QR_DEPTH_KEY_MAX 4294967295U
 
+/* Device ABI: these structs and constants must match lib/quake_raster.c. */
 struct QrRasterVertex {
   float x;
   float y;
@@ -78,6 +79,9 @@ static unsigned qr_depth_key(float depth)
 {
   float scaled = depth * (float)QR_DEPTH_KEY_SCALE;
 
+  if (!(depth == depth)) {
+    return QR_DEPTH_KEY_MAX;
+  }
   if (scaled <= 0.0f) {
     return 0U;
   }
