@@ -7,6 +7,7 @@
 #define QR_SURFACE_CUTOUT 0x80U
 #define QR_SKY_COLOR_INDEX 109U
 #define QR_TEXTURE_MIP_COUNT 4U
+#define QR_DEPTH_TIE_EPSILON 0.000001f
 
 /* Device ABI: these structs and constants must match lib/quake_raster.c. */
 struct QrRasterVertex {
@@ -205,13 +206,14 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   }
   depth = 1.0f / inv_z;
   depth_key = qr_depth_key(depth);
-  if (depth_key > *best_depth_key) {
-    return;
-  }
-  if (depth_key == *best_depth_key && *best_depth < 3.402823466e38f) {
-    if (depth < *best_depth) {
+  if (*best_depth < 3.402823466e38f) {
+    if (depth > *best_depth - QR_DEPTH_TIE_EPSILON) {
+      return;
+    }
+    if (depth_key == *best_depth_key) {
       *order_disagreement = 1U;
     }
+  } else if (depth_key > *best_depth_key) {
     return;
   }
 
@@ -310,7 +312,7 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
       qr_consider_triangle(args, &args->triangles[i], px, py, &best_depth,
                            &best_depth_key, &best_color, &order_disagreement);
       if (args->debug_mode != 5U &&
-          best_depth_key <= args->tile_depth_min[tile]) {
+          best_depth_key < args->tile_depth_min[tile]) {
         break;
       }
     }
@@ -323,7 +325,7 @@ KFD_GPU_KERNEL void qr_world_raster(struct QrWorldRasterArgs *args)
                            &best_depth, &best_depth_key, &best_color,
                            &order_disagreement);
       if (args->debug_mode != 5U &&
-          best_depth_key <= args->tile_depth_min[tile]) {
+          best_depth_key < args->tile_depth_min[tile]) {
         break;
       }
     }

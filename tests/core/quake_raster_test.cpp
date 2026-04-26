@@ -1117,6 +1117,108 @@ TEST_CASE("Quake raster - depth order validation flags fixed-key ties",
   qr_destroy(ctx);
 }
 
+TEST_CASE("Quake raster - fixed-key depth ties still choose nearest surface",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 16;
+  constexpr std::uint32_t HEIGHT = 16;
+  const std::array<std::uint8_t, 4> far_texture{11, 11, 11, 11};
+  const std::array<std::uint8_t, 4> near_texture{22, 22, 22, 22};
+  const std::array<std::uint8_t, 4> lightmap{1, 1, 1, 1};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 2,
+      .max_lightmaps = 1,
+      .max_surfaces = 2,
+      .max_worlds = 1,
+      .texture_atlas_bytes = far_texture.size() + near_texture.size(),
+      .lightmap_atlas_bytes = lightmap.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture far_tex = QR_INVALID_HANDLE;
+  qr_texture near_tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc far_tex_desc{
+      .mips = {{.pixels = far_texture.data(), .width = 2, .height = 2,
+                .stride = 2}},
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_texture_desc near_tex_desc{
+      .mips = {{.pixels = near_texture.data(), .width = 2, .height = 2,
+                .stride = 2}},
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = lightmap.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  const std::array<qr_world_vertex, 4> farther{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.10020F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 0.0F, .z = 0.10020F, .u = 2.0F, .v = 0.0F,
+       .light_u = 2.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 16.0F, .z = 0.10020F, .u = 2.0F, .v = 2.0F,
+       .light_u = 2.0F, .light_v = 2.0F},
+      {.x = 0.0F, .y = 16.0F, .z = 0.10020F, .u = 0.0F, .v = 2.0F,
+       .light_u = 0.0F, .light_v = 2.0F},
+  }};
+  const std::array<qr_world_vertex, 4> nearer{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.10010F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 0.0F, .z = 0.10010F, .u = 2.0F, .v = 0.0F,
+       .light_u = 2.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 16.0F, .z = 0.10010F, .u = 2.0F, .v = 2.0F,
+       .light_u = 2.0F, .light_v = 2.0F},
+      {.x = 0.0F, .y = 16.0F, .z = 0.10010F, .u = 0.0F, .v = 2.0F,
+       .light_u = 0.0F, .light_v = 2.0F},
+  }};
+  std::array<qr_world_surface_desc, 2> surfaces{};
+  std::array<qr_world_polygon_desc, 2> polygons{{
+      {.surface = 0, .vertices = farther.data(),
+       .vertex_count = static_cast<std::uint32_t>(farther.size())},
+      {.surface = 1, .vertices = nearer.data(),
+       .vertex_count = static_cast<std::uint32_t>(nearer.size())},
+  }};
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+  qr_world_draw_desc draw_desc{
+      .world = QR_INVALID_HANDLE,
+      .polygons = polygons.data(),
+      .polygon_count = polygons.size(),
+      .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+  };
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+
+  REQUIRE(qr_upload_texture(ctx, &far_tex_desc, &far_tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_texture(ctx, &near_tex_desc, &near_tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surfaces[0].texture = far_tex;
+  surfaces[0].lightmap = lm;
+  surfaces[1].texture = near_tex;
+  surfaces[1].lightmap = lm;
+  REQUIRE(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+          QR_SUCCESS);
+  draw_desc.world = world;
+
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+  REQUIRE(qr_frame_draw_world(frame, &draw_desc) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+          QR_SUCCESS);
+  CHECK(pixels[static_cast<std::size_t>(8) * WIDTH + 8U] == 22);
+
+  qr_destroy(ctx);
+}
+
 TEST_CASE("Quake raster - tiled raster reports bounded overflow",
           "[quake_raster][device]") {
   constexpr std::uint32_t WIDTH = 16;
