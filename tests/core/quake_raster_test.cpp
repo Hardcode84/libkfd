@@ -250,6 +250,87 @@ TEST_CASE("Quake raster - present mode resolves through callback",
   qr_destroy(ctx);
 }
 
+TEST_CASE("Quake raster - perspective-corrects world texture coordinates",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 4;
+  constexpr std::uint32_t HEIGHT = 1;
+  const std::array<std::uint8_t, 8> texture{0, 1, 2, 3, 4, 5, 6, 7};
+  const std::array<std::uint8_t, 1> light{0};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .texture_atlas_bytes = texture.size(),
+      .lightmap_atlas_bytes = light.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc tex_desc{
+      .mips = {{.pixels = texture.data(), .width = 8, .height = 1,
+                .stride = 8}},
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = light.data(),
+      .width = 1,
+      .height = 1,
+      .stride = 1,
+  };
+  std::array<qr_world_surface_desc, 1> surfaces{};
+  const std::array<qr_world_vertex, 4> quad{{
+      {.x = 0.0F, .y = 0.0F, .z = 1.0F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 0.0F, .z = 4.0F, .u = 8.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 1.0F, .z = 4.0F, .u = 8.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 0.0F, .y = 1.0F, .z = 1.0F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+  }};
+  qr_world_polygon_desc polygon{
+      .surface = 0,
+      .vertices = quad.data(),
+      .vertex_count = static_cast<std::uint32_t>(quad.size()),
+  };
+  qr_world_draw_desc draw_desc{
+      .world = QR_INVALID_HANDLE,
+      .polygons = &polygon,
+      .polygon_count = 1,
+      .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+  };
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+
+  REQUIRE(qr_upload_texture(ctx, &tex_desc, &tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surfaces[0].texture = tex;
+  surfaces[0].lightmap = lm;
+  REQUIRE(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
+          QR_SUCCESS);
+  draw_desc.world = world;
+
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, 99) == QR_SUCCESS);
+  REQUIRE(qr_frame_draw_world(frame, &draw_desc) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+          QR_SUCCESS);
+
+  CHECK(pixels[2] == 2);
+  CHECK(pixels[3] == 5);
+  qr_destroy(ctx);
+}
+
 TEST_CASE("Quake raster - handles classic surface flags and light updates",
           "[quake_raster][device]") {
   constexpr std::uint32_t WIDTH = 4;

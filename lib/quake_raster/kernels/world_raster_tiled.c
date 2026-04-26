@@ -163,6 +163,10 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   float w1;
   float w2;
   float depth;
+  float inv_z0;
+  float inv_z1;
+  float inv_z2;
+  float inv_z;
   unsigned depth_key;
   struct QrSurfaceRecord *surface;
   struct QrTextureRecord *texture;
@@ -188,7 +192,18 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
     return;
   }
 
-  depth = w0 * triangle->v0.z + w1 * triangle->v1.z + w2 * triangle->v2.z;
+  if (triangle->v0.z <= 0.0f || triangle->v1.z <= 0.0f ||
+      triangle->v2.z <= 0.0f) {
+    return;
+  }
+  inv_z0 = 1.0f / triangle->v0.z;
+  inv_z1 = 1.0f / triangle->v1.z;
+  inv_z2 = 1.0f / triangle->v2.z;
+  inv_z = w0 * inv_z0 + w1 * inv_z1 + w2 * inv_z2;
+  if (inv_z <= 0.0f) {
+    return;
+  }
+  depth = 1.0f / inv_z;
   depth_key = qr_depth_key(depth);
   if (depth_key > *best_depth_key) {
     return;
@@ -209,12 +224,20 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   }
   texture = &args->textures[surface->texture];
   lightmap = &args->lightmaps[surface->lightmap];
-  u = w0 * triangle->v0.u + w1 * triangle->v1.u + w2 * triangle->v2.u;
-  v = w0 * triangle->v0.v + w1 * triangle->v1.v + w2 * triangle->v2.v;
-  light_u = w0 * triangle->v0.light_u + w1 * triangle->v1.light_u +
-            w2 * triangle->v2.light_u;
-  light_v = w0 * triangle->v0.light_v + w1 * triangle->v1.light_v +
-            w2 * triangle->v2.light_v;
+  u = (w0 * triangle->v0.u * inv_z0 + w1 * triangle->v1.u * inv_z1 +
+       w2 * triangle->v2.u * inv_z2) /
+      inv_z;
+  v = (w0 * triangle->v0.v * inv_z0 + w1 * triangle->v1.v * inv_z1 +
+       w2 * triangle->v2.v * inv_z2) /
+      inv_z;
+  light_u = (w0 * triangle->v0.light_u * inv_z0 +
+             w1 * triangle->v1.light_u * inv_z1 +
+             w2 * triangle->v2.light_u * inv_z2) /
+            inv_z;
+  light_v = (w0 * triangle->v0.light_v * inv_z0 +
+             w1 * triangle->v1.light_v * inv_z1 +
+             w2 * triangle->v2.light_v * inv_z2) /
+            inv_z;
   if ((surface->flags & QR_SURFACE_TURBULENT) != 0U) {
     int wobble = ((int)(px + py + args->time_seconds * 16.0f) & 3) - 1;
 
