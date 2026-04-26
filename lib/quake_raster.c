@@ -1905,7 +1905,8 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   qr_tile_bin_args *bin_args;
   qr_world_raster_args *args;
   uint32_t preserve_depth;
-  uint64_t start_ns;
+  uint64_t bin_start_ns;
+  uint64_t raster_start_ns;
   uint64_t end_ns;
   int err;
 
@@ -1959,35 +1960,30 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
       (qr_raster_triangle *)kfd_gpu_buffer_gpu(ctx->triangle_buffer);
   bin_args->triangle_count = (uint32_t)triangle_count;
 
-  start_ns = qr_now_ns();
+  bin_start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
                          &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
                          ctx->tile_bin_fence);
-  if (err == 0) {
-    err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
-  }
   if (err != 0) {
     return qr_result_from_gpu_error(err);
   }
-  {
-    qr_result stats_result =
-        qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
-    if (stats_result != QR_SUCCESS) {
-      return stats_result;
-    }
-  }
-  end_ns = qr_now_ns();
-  if (end_ns >= start_ns) {
-    ctx->perf.tile_bin_time_ns += end_ns - start_ns;
-  }
 
-  start_ns = qr_now_ns();
+  /*
+   * The compute queue preserves dispatch order, so the raster pass can consume
+   * the bin output without a host-side fence wait in between.
+   */
+  raster_start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(ctx->gpu, ctx->raster_kernel, &ctx->raster_dispatch,
                          ctx->raster_kernarg, ctx->raster_fence);
   if (err == 0) {
     err = kfd_gpu_fence_wait(ctx->raster_fence, 0U, UINT64_MAX);
   }
   if (err == 0) {
+    qr_result stats_result =
+        qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
+    if (stats_result != QR_SUCCESS) {
+      return stats_result;
+    }
     end_ns = qr_now_ns();
     ++ctx->perf.draw_count;
     ctx->perf.primitive_count += triangle_count;
@@ -1999,8 +1995,11 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
         ctx->last_stats.hiz_candidate_reference_count;
     ctx->perf.hiz_overflow_fallback_count +=
         ctx->last_stats.hiz_overflow_fallback_count;
-    if (end_ns >= start_ns) {
-      ctx->perf.raster_time_ns += end_ns - start_ns;
+    if (raster_start_ns >= bin_start_ns) {
+      ctx->perf.tile_bin_time_ns += raster_start_ns - bin_start_ns;
+    }
+    if (end_ns >= raster_start_ns) {
+      ctx->perf.raster_time_ns += end_ns - raster_start_ns;
     }
     ctx->frame_depth_valid = 1;
   }
