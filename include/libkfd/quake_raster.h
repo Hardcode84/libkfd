@@ -19,7 +19,7 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 8U
+#define QR_API_VERSION_MINOR 9U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
@@ -252,6 +252,24 @@ typedef struct qr_raster_stats {
   uint32_t hiz_overflow_fallback_count;
 } qr_raster_stats;
 
+typedef struct qr_perf_counters {
+  uint64_t frame_count;
+  uint64_t clear_count;
+  uint64_t draw_count;
+  uint64_t resolve_count;
+  uint64_t upload_bytes;
+  uint64_t primitive_count;
+  uint64_t tile_count;
+  uint64_t tile_overflow_count;
+  uint64_t tile_overflow_reference_count;
+  uint64_t hiz_candidate_reference_count;
+  uint64_t hiz_overflow_fallback_count;
+  uint64_t clear_time_ns;
+  uint64_t tile_bin_time_ns;
+  uint64_t raster_time_ns;
+  uint64_t resolve_time_ns;
+} qr_perf_counters;
+
 /* Returns QR_API_VERSION_* packed in 8-bit fields as 0x00MMmmPP. */
 uint32_t qr_api_version(void);
 const char *qr_strerror(qr_result code);
@@ -332,6 +350,7 @@ qr_result qr_upload_alias_model(qr_context *ctx,
                                 const qr_alias_model_desc *desc,
                                 qr_alias_model *out);
 qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);
+qr_result qr_get_perf_counters(qr_context *ctx, qr_perf_counters *out);
 
 /*
  * Returns counters from the most recent qr_frame_draw_world() call. Overflow

@@ -172,7 +172,7 @@ Exit criteria:
 
 ## Milestone 11: Performance And Validation
 
-- [ ] Add renderer perf counters:
+- [x] Add renderer perf counters:
   - command counts
   - primitive counts
   - tile counts
@@ -180,10 +180,10 @@ Exit criteria:
   - HiZ reject counts
   - GPU pass timings
   - upload bytes
-- [ ] Add deterministic timedemo/headless benchmark mode.
-- [ ] Add image-diff tool against known-good dumps.
-- [ ] Add stress scenes for large polygons, dense entities, and overflow paths.
-- [ ] Add CI-friendly nooutput test subset.
+- [x] Add deterministic timedemo/headless benchmark mode.
+- [x] Add image-diff tool against known-good dumps.
+- [x] Add stress scenes for large polygons, dense entities, and overflow paths.
+- [x] Add CI-friendly nooutput test subset.
 
 Exit criteria:
 

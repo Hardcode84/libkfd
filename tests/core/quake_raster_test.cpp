@@ -947,6 +947,19 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
   render_mode(QR_DEBUG_DEPTH);
   CHECK(pixels[0] == 239);
   CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 252);
+  {
+    qr_perf_counters perf{};
+    REQUIRE(qr_get_perf_counters(ctx, &perf) == QR_SUCCESS);
+    CHECK(perf.frame_count >= 5);
+    CHECK(perf.clear_count >= 5);
+    CHECK(perf.draw_count >= 5);
+    CHECK(perf.primitive_count >= 20);
+    CHECK(perf.tile_count >= 5);
+    CHECK(perf.upload_bytes >= far_texture.size() + near_texture.size() +
+                                   far_light.size() + near_light.size());
+    CHECK(perf.tile_bin_time_ns > 0);
+    CHECK(perf.raster_time_ns > 0);
+  }
 
   {
     qr_frame *frame = nullptr;
