@@ -27,12 +27,12 @@ Exit criteria:
 
 ## Milestone 1: Nooutput Diagnostics
 
-- [ ] Add `qr_dump_indexed()` for raw indexed framebuffer dumps.
-- [ ] Add `qr_dump_xrgb()` or equivalent resolved-output inspection path.
-- [ ] Define dump file format: raw, simple PPM, or both.
-- [ ] Add deterministic clear/fill pattern test.
-- [ ] Add stride/readback tests for padded destinations.
-- [ ] Add failure tests for undersized readback buffers.
+- [x] Add `qr_dump_indexed()` for raw indexed framebuffer dumps.
+- [x] Add `qr_dump_xrgb()` or equivalent resolved-output inspection path.
+- [x] Define dump file format: raw, simple PPM, or both.
+- [x] Add deterministic clear/fill pattern test.
+- [x] Add stride/readback tests for padded destinations.
+- [x] Add failure tests for undersized readback buffers.
 
 Exit criteria:
 
@@ -41,13 +41,13 @@ Exit criteria:
 
 ## Milestone 2: GPU Kernel Package
 
-- [ ] Add renderer-owned GPU kernel source directory.
-- [ ] Add CMake helper to build renderer kernels for supported AMDGPU targets.
-- [ ] Add kernel selection/load path inside `qr_context`.
-- [ ] Add GPU clear indexed kernel.
-- [ ] Add indexed-to-XRGB resolve kernel.
-- [ ] Add nooutput test that clears through GPU dispatch, not CPU `memset`.
-- [ ] Add readback path for indexed framebuffer after GPU work completion.
+- [x] Add renderer-owned GPU kernel source directory.
+- [x] Add CMake helper to build renderer kernels for supported AMDGPU targets.
+- [x] Add kernel selection/load path inside `qr_context`.
+- [x] Add GPU clear indexed kernel.
+- [x] Add indexed-to-XRGB resolve kernel.
+- [x] Add nooutput test that clears through GPU dispatch, not CPU `memset`.
+- [x] Add readback path for indexed framebuffer after GPU work completion.
 
 Exit criteria:
 

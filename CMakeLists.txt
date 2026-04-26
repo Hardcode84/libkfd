@@ -144,6 +144,57 @@ target_compile_options(quake_raster PRIVATE
 )
 target_link_libraries(quake_raster PUBLIC kfd)
 
+function(quake_raster_add_gpu_kernel name source_file)
+  set(targets "")
+  set(entries "")
+
+  foreach(arch IN LISTS LIBKFD_GPU_ARCHS)
+    string(REPLACE "-" "_" suffix "${arch}")
+    set(target "quake_raster_${name}_${suffix}")
+
+    add_executable(${target} ${source_file})
+    set_target_properties(${target} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/quake_raster/kernels"
+    )
+    target_include_directories(${target} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(${target} PRIVATE
+      --target=amdgcn--amdhsa
+      -mcpu=${arch}
+      -nogpulib
+      -nostdlibinc
+      -O2
+    )
+    target_link_options(${target} PRIVATE
+      --target=amdgcn--amdhsa
+      -mcpu=${arch}
+    )
+
+    list(APPEND targets ${target})
+    string(APPEND entries
+      "  {\"$<TARGET_FILE:${target}>\", \"${arch}\"},\n")
+  endforeach()
+
+  set(${name}_targets ${targets} PARENT_SCOPE)
+  file(GENERATE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/quake_raster_${name}_kernels.inc"
+    CONTENT "${entries}"
+  )
+endfunction()
+
+quake_raster_add_gpu_kernel(clear_indexed
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/clear_indexed.c)
+quake_raster_add_gpu_kernel(resolve_xrgb
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/resolve_xrgb.c)
+target_include_directories(quake_raster PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+if(clear_indexed_targets)
+  add_dependencies(quake_raster ${clear_indexed_targets})
+endif()
+if(resolve_xrgb_targets)
+  add_dependencies(quake_raster ${resolve_xrgb_targets})
+endif()
+
 add_subdirectory(lib)
 
 if(PROJECT_IS_TOP_LEVEL)

@@ -54,6 +54,12 @@ int qr_end_frame(qr_frame *frame);
 
 int qr_read_indexed(qr_context *ctx, void *dst, size_t dst_size,
                     size_t dst_stride);
+int qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
+                 size_t dst_size, size_t dst_stride_pixels);
+
+int qr_dump_indexed(qr_context *ctx, const char *path);
+int qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
+                 const char *path);
 
 #ifdef __cplusplus
 } /* extern "C" */

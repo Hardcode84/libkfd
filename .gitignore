@@ -1,6 +1,7 @@
 # Build directories
 build/
 out/
+CMakeFiles/
 
 # Compilation artifacts
 *.o
