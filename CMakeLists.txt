@@ -187,14 +187,19 @@ quake_raster_add_gpu_kernel(clear_indexed
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/clear_indexed.c)
 quake_raster_add_gpu_kernel(resolve_xrgb
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/resolve_xrgb.c)
+quake_raster_add_gpu_kernel(tile_bin
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/tile_bin.c)
 quake_raster_add_gpu_kernel(world_raster
-  ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/world_raster.c)
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/quake_raster/kernels/world_raster_tiled.c)
 target_include_directories(quake_raster PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 if(clear_indexed_targets)
   add_dependencies(quake_raster ${clear_indexed_targets})
 endif()
 if(resolve_xrgb_targets)
   add_dependencies(quake_raster ${resolve_xrgb_targets})
+endif()
+if(tile_bin_targets)
+  add_dependencies(quake_raster ${tile_bin_targets})
 endif()
 if(world_raster_targets)
   add_dependencies(quake_raster ${world_raster_targets})

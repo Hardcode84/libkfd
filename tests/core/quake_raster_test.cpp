@@ -507,6 +507,20 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
   render_mode(QR_DEBUG_TEXTURE_ONLY);
   CHECK(pixels[0] == 0);
   CHECK(pixels[static_cast<std::size_t>(1) * WIDTH + 1U] == 90);
+  {
+    qr_raster_stats stats{};
+    REQUIRE(qr_get_raster_stats(ctx, &stats) == QR_SUCCESS);
+    CHECK(stats.tile_size == QR_TILE_SIZE);
+    CHECK(stats.tile_cols == 1);
+    CHECK(stats.tile_rows == 1);
+    CHECK(stats.tile_count == 1);
+    CHECK(stats.tile_triangle_capacity == QR_TILE_TRIANGLE_CAPACITY);
+    CHECK(stats.triangle_count == 4);
+    CHECK(stats.occupied_tile_count == 1);
+    CHECK(stats.max_tile_triangle_count == 4);
+    CHECK(stats.overflow_tile_count == 0);
+    CHECK(stats.overflow_reference_count == 0);
+  }
 
   render_mode(QR_DEBUG_FLAT_SURFACE_ID);
   CHECK(pixels[0] == 1);
@@ -548,6 +562,100 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
     CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
     REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
   }
+
+  qr_destroy(ctx);
+}
+
+TEST_CASE("Quake raster - tiled raster reports bounded overflow",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 16;
+  constexpr std::uint32_t HEIGHT = 16;
+  constexpr std::size_t POLYGON_COUNT =
+      (QR_TILE_TRIANGLE_CAPACITY / 2U) + 2U;
+  const std::array<std::uint8_t, 4> texture{42, 42, 42, 42};
+  const std::array<std::uint8_t, 4> lightmap{7, 7, 7, 7};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .texture_atlas_bytes = texture.size(),
+      .lightmap_atlas_bytes = lightmap.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc tex_desc{
+      .mips =
+          {
+              {.pixels = texture.data(), .width = 2, .height = 2, .stride = 2},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = lightmap.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  qr_world_surface_desc surface{};
+  const std::array<qr_world_vertex, 4> quad{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.25F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 0.0F, .z = 0.25F, .u = 2.0F, .v = 0.0F,
+       .light_u = 2.0F, .light_v = 0.0F},
+      {.x = 16.0F, .y = 16.0F, .z = 0.25F, .u = 2.0F, .v = 2.0F,
+       .light_u = 2.0F, .light_v = 2.0F},
+      {.x = 0.0F, .y = 16.0F, .z = 0.25F, .u = 0.0F, .v = 2.0F,
+       .light_u = 0.0F, .light_v = 2.0F},
+  }};
+  std::vector<qr_world_polygon_desc> polygons(POLYGON_COUNT);
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+  qr_world_draw_desc draw_desc{};
+  qr_raster_stats stats{};
+
+  REQUIRE(qr_get_raster_stats(nullptr, &stats) == QR_ERROR_INVALID_ARGUMENT);
+  REQUIRE(qr_upload_texture(ctx, &tex_desc, &tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surface.texture = tex;
+  surface.lightmap = lm;
+  REQUIRE(qr_create_world(ctx, &surface, 1, &world) == QR_SUCCESS);
+
+  for (qr_world_polygon_desc &polygon : polygons) {
+    polygon.surface = 0;
+    polygon.vertices = quad.data();
+    polygon.vertex_count = static_cast<std::uint32_t>(quad.size());
+  }
+
+  draw_desc.world = world;
+  draw_desc.polygons = polygons.data();
+  draw_desc.polygon_count = polygons.size();
+  draw_desc.debug_mode = QR_DEBUG_TEXTURE_ONLY;
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+  REQUIRE(qr_frame_draw_world(frame, &draw_desc) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  REQUIRE(qr_get_raster_stats(ctx, &stats) == QR_SUCCESS);
+  CHECK(stats.tile_count == 1);
+  CHECK(stats.triangle_count == POLYGON_COUNT * 2U);
+  CHECK(stats.max_tile_triangle_count == QR_TILE_TRIANGLE_CAPACITY);
+  CHECK(stats.overflow_tile_count == 1);
+  CHECK(stats.overflow_reference_count == (POLYGON_COUNT * 2U) -
+                                              QR_TILE_TRIANGLE_CAPACITY);
+
+  REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+          QR_SUCCESS);
+  CHECK(std::all_of(pixels.begin(), pixels.end(),
+                    [](std::uint8_t pixel) { return pixel == 42; }));
 
   qr_destroy(ctx);
 }

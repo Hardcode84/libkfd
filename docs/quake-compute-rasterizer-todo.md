@@ -104,13 +104,13 @@ Exit criteria:
 
 ## Milestone 6: 16x16 Tiled Raster
 
-- [ ] Define `16x16` tile grid and tile metadata buffers.
-- [ ] Add tile list counter/offset buffers.
-- [ ] Add primitive-to-tile binning pass.
-- [ ] Add bounded overflow policy.
-- [ ] Add tile raster kernel.
-- [ ] Preserve deterministic per-tile primitive order for opaque world.
-- [ ] Compare performance against minimal non-tiled raster.
+- [x] Define `16x16` tile grid and tile metadata buffers.
+- [x] Add tile list counter/offset buffers.
+- [x] Add primitive-to-tile binning pass.
+- [x] Add bounded overflow policy.
+- [x] Add tile raster kernel.
+- [x] Preserve deterministic per-tile primitive order for opaque world.
+- [x] Compare performance against minimal non-tiled raster.
 
 Exit criteria:
 

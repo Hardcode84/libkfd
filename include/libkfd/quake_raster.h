@@ -19,11 +19,13 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 2U
+#define QR_API_VERSION_MINOR 3U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
 #define QR_COLORMAP_SIZE (256U * 256U)
+#define QR_TILE_SIZE 16U
+#define QR_TILE_TRIANGLE_CAPACITY 256U
 
 typedef enum qr_result {
   QR_SUCCESS = 0,
@@ -151,6 +153,19 @@ typedef struct qr_capacity_info {
   uint32_t world_capacity;
 } qr_capacity_info;
 
+typedef struct qr_raster_stats {
+  uint32_t tile_size;
+  uint32_t tile_cols;
+  uint32_t tile_rows;
+  uint32_t tile_count;
+  uint32_t tile_triangle_capacity;
+  uint32_t triangle_count;
+  uint32_t occupied_tile_count;
+  uint32_t max_tile_triangle_count;
+  uint32_t overflow_tile_count;
+  uint32_t overflow_reference_count;
+} qr_raster_stats;
+
 /* Returns QR_API_VERSION_* packed in 8-bit fields as 0x00MMmmPP. */
 uint32_t qr_api_version(void);
 const char *qr_strerror(qr_result code);
@@ -177,10 +192,11 @@ qr_output_mode qr_output(const qr_context *ctx);
  *
  * qr_frame_draw_world() takes screen-space polygon vertices. The CPU setup path
  * triangulates each polygon as a fan, uploads that transient command list, then
- * the GPU raster pass draws opaque surfaces with nearest texture/lightmap
- * sampling. In shaded mode, colormap must point at QR_COLORMAP_SIZE bytes using
- * light*256 + texel indexing. Submit the full visible opaque world batch in one
- * call; the MVP raster pass rebuilds its depth state for that submitted batch.
+ * a 16x16 tiled GPU raster pass draws opaque surfaces with nearest
+ * texture/lightmap sampling. In shaded mode, colormap must point at
+ * QR_COLORMAP_SIZE bytes using light*256 + texel indexing. Submit the full
+ * visible opaque world batch in one call; the MVP raster pass rebuilds its
+ * depth state and tile lists for that submitted batch.
  */
 qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
                          qr_frame **out);
@@ -214,6 +230,12 @@ qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
 qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
                           size_t surface_count, qr_world *out);
 qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);
+
+/*
+ * Returns counters from the most recent qr_frame_draw_world() call. Overflow
+ * references are handled by a deterministic full-list fallback for that tile.
+ */
+qr_result qr_get_raster_stats(qr_context *ctx, qr_raster_stats *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

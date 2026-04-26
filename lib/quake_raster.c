@@ -18,6 +18,7 @@
 #define QR_DEFAULT_LIGHTMAP_ATLAS_BYTES (4U * 1024U * 1024U)
 #define QR_RASTER_BLOCK_X 8U
 #define QR_RASTER_BLOCK_Y 8U
+#define QR_TILE_BIN_BLOCK_X 64U
 
 typedef struct qr_kernel_candidate {
   const char *path;
@@ -100,7 +101,26 @@ typedef struct qr_world_raster_args {
   uint32_t height;
   uint32_t triangle_count;
   uint32_t debug_mode;
+  uint32_t *tile_indices;
+  uint32_t *tile_counts;
+  uint32_t *tile_overflows;
+  uint32_t tile_cols;
+  uint32_t tile_rows;
+  uint32_t tile_triangle_capacity;
 } qr_world_raster_args;
+
+typedef struct qr_tile_bin_args {
+  qr_raster_triangle *triangles;
+  uint32_t *tile_indices;
+  uint32_t *tile_counts;
+  uint32_t *tile_overflows;
+  uint32_t width;
+  uint32_t height;
+  uint32_t triangle_count;
+  uint32_t tile_cols;
+  uint32_t tile_rows;
+  uint32_t tile_triangle_capacity;
+} qr_tile_bin_args;
 
 static const qr_kernel_candidate qr_clear_indexed_kernels[] = {
 #include "quake_raster_clear_indexed_kernels.inc"
@@ -114,6 +134,11 @@ static const qr_kernel_candidate qr_resolve_xrgb_kernels[] = {
 
 static const qr_kernel_candidate qr_world_raster_kernels[] = {
 #include "quake_raster_world_raster_kernels.inc"
+    {NULL, NULL}
+};
+
+static const qr_kernel_candidate qr_tile_bin_kernels[] = {
+#include "quake_raster_tile_bin_kernels.inc"
     {NULL, NULL}
 };
 
@@ -154,6 +179,19 @@ struct qr_context {
   kfd_gpu_buffer *raster_kernarg;
   kfd_gpu_fence *raster_fence;
   kfd_gpu_dispatch_config raster_dispatch;
+  kfd_gpu_module *tile_bin_module;
+  kfd_gpu_kernel *tile_bin_kernel;
+  kfd_gpu_buffer *tile_bin_root;
+  kfd_gpu_buffer *tile_bin_kernarg;
+  kfd_gpu_fence *tile_bin_fence;
+  kfd_gpu_dispatch_config tile_bin_dispatch;
+  kfd_gpu_buffer *tile_indices;
+  kfd_gpu_buffer *tile_counts;
+  kfd_gpu_buffer *tile_overflows;
+  uint32_t tile_cols;
+  uint32_t tile_rows;
+  uint32_t tile_count;
+  qr_raster_stats last_stats;
   uint32_t width;
   uint32_t height;
   size_t indexed_bytes;
@@ -240,6 +278,8 @@ static size_t qr_default_size(size_t value, size_t fallback)
 }
 
 static int qr_rect_tight_size(uint32_t width, uint32_t height, size_t *out);
+static int qr_create_upload_buffer(qr_context *ctx, size_t size,
+                                   kfd_gpu_buffer **out);
 
 static int qr_mul_size(size_t lhs, size_t rhs, size_t *out)
 {
@@ -488,6 +528,14 @@ static void qr_destroy_raster_kernel(qr_context *ctx)
   if (ctx == NULL) {
     return;
   }
+  kfd_gpu_fence_destroy(ctx->tile_bin_fence);
+  kfd_gpu_buffer_destroy(ctx->tile_bin_kernarg);
+  kfd_gpu_buffer_destroy(ctx->tile_bin_root);
+  kfd_gpu_kernel_destroy(ctx->tile_bin_kernel);
+  kfd_gpu_module_destroy(ctx->tile_bin_module);
+  kfd_gpu_buffer_destroy(ctx->tile_overflows);
+  kfd_gpu_buffer_destroy(ctx->tile_counts);
+  kfd_gpu_buffer_destroy(ctx->tile_indices);
   kfd_gpu_fence_destroy(ctx->raster_fence);
   kfd_gpu_buffer_destroy(ctx->raster_kernarg);
   kfd_gpu_buffer_destroy(ctx->raster_root);
@@ -502,6 +550,14 @@ static void qr_destroy_raster_kernel(qr_context *ctx)
   ctx->raster_module = NULL;
   ctx->raster_colormap = NULL;
   ctx->depth = NULL;
+  ctx->tile_bin_fence = NULL;
+  ctx->tile_bin_kernarg = NULL;
+  ctx->tile_bin_root = NULL;
+  ctx->tile_bin_kernel = NULL;
+  ctx->tile_bin_module = NULL;
+  ctx->tile_overflows = NULL;
+  ctx->tile_counts = NULL;
+  ctx->tile_indices = NULL;
 }
 
 static int qr_load_clear_kernel(qr_context *ctx)
@@ -697,15 +753,123 @@ static int qr_load_resolve_kernel(qr_context *ctx)
   return last_err;
 }
 
-static int qr_load_raster_kernel(qr_context *ctx)
+static int qr_load_tile_bin_kernel(qr_context *ctx)
 {
   const qr_kernel_candidate *candidate;
-  qr_world_raster_args *args;
+  qr_tile_bin_args *args;
   int last_err;
   int err;
 
   if (ctx == NULL) {
     return EINVAL;
+  }
+
+  last_err = ENOENT;
+  for (candidate = qr_tile_bin_kernels; candidate->path != NULL; ++candidate) {
+    uint8_t *image;
+    size_t image_size;
+
+    image = NULL;
+    image_size = 0U;
+    err = qr_read_file(candidate->path, &image, &image_size);
+    if (err != 0) {
+      last_err = err;
+      continue;
+    }
+    err = kfd_gpu_module_load(ctx->gpu, image, image_size,
+                              &ctx->tile_bin_module);
+    qr_free_bytes(image);
+    if (err != 0) {
+      last_err = err;
+      continue;
+    }
+    err = kfd_gpu_module_kernel(ctx->tile_bin_module, "qr_bin_tiles.kd",
+                                &ctx->tile_bin_kernel);
+    if (err != 0) {
+      qr_destroy_raster_kernel(ctx);
+      return err;
+    }
+    err = kfd_gpu_buffer_create(ctx->gpu, sizeof(qr_tile_bin_args),
+                                KFD_GPU_MEMORY_UPLOAD,
+                                KFD_GPU_MEMORY_WRITABLE |
+                                    KFD_GPU_MEMORY_COHERENT |
+                                    KFD_GPU_MEMORY_UNCACHED,
+                                &ctx->tile_bin_root);
+    if (err != 0) {
+      qr_destroy_raster_kernel(ctx);
+      return err;
+    }
+    err = kfd_gpu_kernel_alloc_args(ctx->tile_bin_kernel,
+                                    &ctx->tile_bin_kernarg);
+    if (err != 0) {
+      qr_destroy_raster_kernel(ctx);
+      return err;
+    }
+    err = kfd_gpu_fence_create(ctx->gpu, 1U, &ctx->tile_bin_fence);
+    if (err != 0) {
+      qr_destroy_raster_kernel(ctx);
+      return err;
+    }
+
+    ctx->tile_bin_dispatch.grid.x =
+        (ctx->tile_count + QR_TILE_BIN_BLOCK_X - 1U) / QR_TILE_BIN_BLOCK_X;
+    ctx->tile_bin_dispatch.grid.y = 1U;
+    ctx->tile_bin_dispatch.grid.z = 1U;
+    ctx->tile_bin_dispatch.block.x = QR_TILE_BIN_BLOCK_X;
+    ctx->tile_bin_dispatch.block.y = 1U;
+    ctx->tile_bin_dispatch.block.z = 1U;
+    ctx->tile_bin_dispatch.dynamic_lds = 0U;
+    ctx->tile_bin_dispatch.private_segment_size = 0U;
+
+    args = (qr_tile_bin_args *)kfd_gpu_buffer_cpu(ctx->tile_bin_root);
+    if (args == NULL) {
+      qr_destroy_raster_kernel(ctx);
+      return EIO;
+    }
+    memset(args, 0, sizeof(*args));
+    args->tile_indices = (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_indices);
+    args->tile_counts = (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_counts);
+    args->tile_overflows = (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_overflows);
+    args->width = ctx->width;
+    args->height = ctx->height;
+    args->tile_cols = ctx->tile_cols;
+    args->tile_rows = ctx->tile_rows;
+    args->tile_triangle_capacity = QR_TILE_TRIANGLE_CAPACITY;
+    kfd_gpu_kernel_set_root(ctx->tile_bin_kernel, ctx->tile_bin_kernarg,
+                            kfd_gpu_buffer_gpu(ctx->tile_bin_root),
+                            &ctx->tile_bin_dispatch);
+    return 0;
+  }
+
+  return last_err;
+}
+
+static int qr_load_raster_kernel(qr_context *ctx)
+{
+  const qr_kernel_candidate *candidate;
+  qr_world_raster_args *args;
+  size_t tile_refs;
+  size_t tile_index_bytes;
+  size_t tile_counter_bytes;
+  int last_err;
+  int err;
+
+  if (ctx == NULL) {
+    return EINVAL;
+  }
+  ctx->tile_cols = (ctx->width + QR_TILE_SIZE - 1U) / QR_TILE_SIZE;
+  ctx->tile_rows = (ctx->height + QR_TILE_SIZE - 1U) / QR_TILE_SIZE;
+  if (ctx->tile_cols == 0U || ctx->tile_rows == 0U ||
+      ctx->tile_cols > UINT32_MAX / ctx->tile_rows) {
+    return EOVERFLOW;
+  }
+  ctx->tile_count = ctx->tile_cols * ctx->tile_rows;
+  if (qr_mul_size((size_t)ctx->tile_count, QR_TILE_TRIANGLE_CAPACITY,
+                  &tile_refs) != 0 ||
+      qr_mul_size(tile_refs, sizeof(uint32_t), &tile_index_bytes) != 0 ||
+      qr_mul_size((size_t)ctx->tile_count, sizeof(uint32_t),
+                  &tile_counter_bytes) != 0) {
+    return EOVERFLOW;
   }
   err = kfd_gpu_buffer_create(ctx->gpu, ctx->indexed_bytes * sizeof(float),
                               KFD_GPU_MEMORY_UPLOAD,
@@ -722,6 +886,26 @@ static int qr_load_raster_kernel(qr_context *ctx)
                                   KFD_GPU_MEMORY_COHERENT |
                                   KFD_GPU_MEMORY_UNCACHED,
                               &ctx->raster_colormap);
+  if (err != 0) {
+    qr_destroy_raster_kernel(ctx);
+    return err;
+  }
+  err = qr_create_upload_buffer(ctx, tile_index_bytes, &ctx->tile_indices);
+  if (err != 0) {
+    qr_destroy_raster_kernel(ctx);
+    return err;
+  }
+  err = qr_create_upload_buffer(ctx, tile_counter_bytes, &ctx->tile_counts);
+  if (err != 0) {
+    qr_destroy_raster_kernel(ctx);
+    return err;
+  }
+  err = qr_create_upload_buffer(ctx, tile_counter_bytes, &ctx->tile_overflows);
+  if (err != 0) {
+    qr_destroy_raster_kernel(ctx);
+    return err;
+  }
+  err = qr_load_tile_bin_kernel(ctx);
   if (err != 0) {
     qr_destroy_raster_kernel(ctx);
     return err;
@@ -773,13 +957,11 @@ static int qr_load_raster_kernel(qr_context *ctx)
       return err;
     }
 
-    ctx->raster_dispatch.grid.x =
-        (ctx->width + QR_RASTER_BLOCK_X - 1U) / QR_RASTER_BLOCK_X;
-    ctx->raster_dispatch.grid.y =
-        (ctx->height + QR_RASTER_BLOCK_Y - 1U) / QR_RASTER_BLOCK_Y;
+    ctx->raster_dispatch.grid.x = ctx->tile_cols;
+    ctx->raster_dispatch.grid.y = ctx->tile_rows;
     ctx->raster_dispatch.grid.z = 1U;
-    ctx->raster_dispatch.block.x = QR_RASTER_BLOCK_X;
-    ctx->raster_dispatch.block.y = QR_RASTER_BLOCK_Y;
+    ctx->raster_dispatch.block.x = QR_TILE_SIZE;
+    ctx->raster_dispatch.block.y = QR_TILE_SIZE;
     ctx->raster_dispatch.block.z = 1U;
     ctx->raster_dispatch.dynamic_lds = 0U;
     ctx->raster_dispatch.private_segment_size = 0U;
@@ -801,6 +983,13 @@ static int qr_load_raster_kernel(qr_context *ctx)
     args->colormap = (uint8_t *)kfd_gpu_buffer_gpu(ctx->raster_colormap);
     args->width = ctx->width;
     args->height = ctx->height;
+    args->tile_indices = (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_indices);
+    args->tile_counts = (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_counts);
+    args->tile_overflows =
+        (uint32_t *)kfd_gpu_buffer_gpu(ctx->tile_overflows);
+    args->tile_cols = ctx->tile_cols;
+    args->tile_rows = ctx->tile_rows;
+    args->tile_triangle_capacity = QR_TILE_TRIANGLE_CAPACITY;
     kfd_gpu_kernel_set_root(ctx->raster_kernel, ctx->raster_kernarg,
                             kfd_gpu_buffer_gpu(ctx->raster_root),
                             &ctx->raster_dispatch);
@@ -1181,12 +1370,62 @@ static int qr_valid_debug_mode(qr_debug_mode mode)
   return 0;
 }
 
+static void qr_reset_raster_stats(qr_context *ctx)
+{
+  if (ctx == NULL) {
+    return;
+  }
+  memset(&ctx->last_stats, 0, sizeof(ctx->last_stats));
+  ctx->last_stats.tile_size = QR_TILE_SIZE;
+  ctx->last_stats.tile_cols = ctx->tile_cols;
+  ctx->last_stats.tile_rows = ctx->tile_rows;
+  ctx->last_stats.tile_count = ctx->tile_count;
+  ctx->last_stats.tile_triangle_capacity = QR_TILE_TRIANGLE_CAPACITY;
+}
+
+static qr_result qr_collect_tile_stats(qr_context *ctx, uint32_t triangle_count)
+{
+  const uint32_t *counts;
+  const uint32_t *overflows;
+  uint32_t i;
+
+  if (ctx == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  counts = (const uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_counts);
+  overflows = (const uint32_t *)kfd_gpu_buffer_cpu(ctx->tile_overflows);
+  if (counts == NULL || overflows == NULL) {
+    return QR_ERROR_IO;
+  }
+  qr_reset_raster_stats(ctx);
+  ctx->last_stats.triangle_count = triangle_count;
+  for (i = 0U; i < ctx->tile_count; ++i) {
+    if (counts[i] != 0U) {
+      ++ctx->last_stats.occupied_tile_count;
+    }
+    if (counts[i] > ctx->last_stats.max_tile_triangle_count) {
+      ctx->last_stats.max_tile_triangle_count = counts[i];
+    }
+    if (overflows[i] != 0U) {
+      ++ctx->last_stats.overflow_tile_count;
+      if (UINT32_MAX - ctx->last_stats.overflow_reference_count <
+          overflows[i]) {
+        ctx->last_stats.overflow_reference_count = UINT32_MAX;
+      } else {
+        ctx->last_stats.overflow_reference_count += overflows[i];
+      }
+    }
+  }
+  return QR_SUCCESS;
+}
+
 qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
 {
   qr_context *ctx;
   qr_world_record *world;
   kfd_gpu_buffer *triangle_buffer;
   qr_raster_triangle *triangles;
+  qr_tile_bin_args *bin_args;
   qr_world_raster_args *args;
   size_t triangle_count;
   size_t triangle_bytes;
@@ -1208,6 +1447,7 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
     return QR_ERROR_INVALID_ARGUMENT;
   }
   if (desc->polygon_count == 0U) {
+    qr_reset_raster_stats(ctx);
     return QR_SUCCESS;
   }
   if (desc->polygons == NULL) {
@@ -1284,6 +1524,33 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
   args->triangles = (qr_raster_triangle *)kfd_gpu_buffer_gpu(triangle_buffer);
   args->triangle_count = (uint32_t)triangle_count;
   args->debug_mode = (uint32_t)desc->debug_mode;
+
+  bin_args = (qr_tile_bin_args *)kfd_gpu_buffer_cpu(ctx->tile_bin_root);
+  if (bin_args == NULL) {
+    kfd_gpu_buffer_destroy(triangle_buffer);
+    return QR_ERROR_IO;
+  }
+  bin_args->triangles = (qr_raster_triangle *)kfd_gpu_buffer_gpu(triangle_buffer);
+  bin_args->triangle_count = (uint32_t)triangle_count;
+
+  err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
+                         &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
+                         ctx->tile_bin_fence);
+  if (err == 0) {
+    err = kfd_gpu_fence_wait(ctx->tile_bin_fence, 0U, UINT64_MAX);
+  }
+  if (err != 0) {
+    kfd_gpu_buffer_destroy(triangle_buffer);
+    return qr_result_from_gpu_error(err);
+  }
+  {
+    qr_result stats_result =
+        qr_collect_tile_stats(ctx, (uint32_t)triangle_count);
+    if (stats_result != QR_SUCCESS) {
+      kfd_gpu_buffer_destroy(triangle_buffer);
+      return stats_result;
+    }
+  }
 
   err = kfd_gpu_dispatch(ctx->gpu, ctx->raster_kernel, &ctx->raster_dispatch,
                          ctx->raster_kernarg, ctx->raster_fence);
@@ -1671,5 +1938,14 @@ qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out)
   out->surface_capacity = ctx->surface_capacity;
   out->world_count = ctx->world_count;
   out->world_capacity = ctx->world_capacity;
+  return QR_SUCCESS;
+}
+
+qr_result qr_get_raster_stats(qr_context *ctx, qr_raster_stats *out)
+{
+  if (ctx == NULL || out == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  *out = ctx->last_stats;
   return QR_SUCCESS;
 }
