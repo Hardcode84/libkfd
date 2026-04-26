@@ -974,6 +974,8 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
         {.surface = 99, .vertices = far_quad.data(),
          .vertex_count = static_cast<std::uint32_t>(far_quad.size())},
     }};
+    auto nonfinite_quad = far_quad;
+    nonfinite_quad[0].z = std::numeric_limits<float>::quiet_NaN();
 
     REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
     CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
@@ -981,6 +983,9 @@ TEST_CASE("Quake raster - minimal world raster draws indexed polygons",
     bad_draw.colormap_size = colormap.size();
     bad_draw.polygons = bad_polygons.data();
     bad_draw.polygon_count = bad_polygons.size();
+    CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
+    bad_polygons[0].surface = 0;
+    bad_polygons[0].vertices = nonfinite_quad.data();
     CHECK(qr_frame_draw_world(frame, &bad_draw) == QR_ERROR_INVALID_ARGUMENT);
     REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
   }

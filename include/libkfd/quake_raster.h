@@ -58,10 +58,14 @@ typedef enum qr_framebuffer_format {
 
 typedef enum qr_debug_mode {
   QR_DEBUG_SHADED = 0,
+  /* Visualizes surface ids as flat indexed colors. */
   QR_DEBUG_FLAT_SURFACE_ID,
+  /* Visualizes the fixed-point depth key used for ordering. */
   QR_DEBUG_DEPTH,
+  /* Samples only texture/lightmap data, bypassing shaded colormap lookup. */
   QR_DEBUG_TEXTURE_ONLY,
   QR_DEBUG_LIGHT_ONLY,
+  /* Marks pixels where fixed-key and float-depth ordering would disagree. */
   QR_DEBUG_DEPTH_ORDER
 } qr_debug_mode;
 
@@ -248,7 +252,9 @@ typedef struct qr_raster_stats {
   uint32_t overflow_reference_count;
   uint32_t depth_key_scale;
   uint32_t depth_bound_tile_count;
+  /* Triangle references visited by the most recent submitted draw batch. */
   uint32_t hiz_candidate_reference_count;
+  /* Overflow references that forced full-list tile fallback in that batch. */
   uint32_t hiz_overflow_fallback_count;
 } qr_raster_stats;
 
@@ -299,13 +305,13 @@ qr_output_mode qr_output(const qr_context *ctx);
  * qr_end_frame(). The current implementation executes clear/resolve work
  * synchronously before returning from the API that submits it.
  *
- * qr_frame_draw_world() takes screen-space polygon vertices. The CPU setup path
- * triangulates each polygon as a fan, uploads that transient command list, then
- * a 16x16 tiled GPU raster pass draws opaque surfaces with nearest
- * texture/lightmap sampling. In shaded mode, colormap must point at
- * QR_COLORMAP_SIZE bytes using light*256 + texel indexing. Submit the full
- * visible opaque world batch in one call; the MVP raster pass rebuilds its
- * depth state and tile lists for that submitted batch.
+ * qr_frame_draw_world() takes finite screen-space polygon vertices. The CPU
+ * setup path triangulates each polygon as a fan, writes the transient command
+ * list into context-owned GPU memory, then a 16x16 tiled GPU raster pass draws
+ * opaque surfaces with nearest texture/lightmap sampling. In shaded mode,
+ * colormap must point at QR_COLORMAP_SIZE bytes using light*256 + texel
+ * indexing. Submit the full visible opaque world batch in one call; each draw
+ * call rebuilds its own depth state and tile lists.
  */
 qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
                          qr_frame **out);
@@ -353,8 +359,9 @@ qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);
 qr_result qr_get_perf_counters(qr_context *ctx, qr_perf_counters *out);
 
 /*
- * Returns counters from the most recent qr_frame_draw_world() call. Overflow
- * references are handled by a deterministic full-list fallback for that tile.
+ * Returns counters from the most recent triangle draw call, including world,
+ * alias, sprite, or particle submissions. Overflow references are handled by a
+ * deterministic full-list fallback for that tile.
  */
 qr_result qr_get_raster_stats(qr_context *ctx, qr_raster_stats *out);
 

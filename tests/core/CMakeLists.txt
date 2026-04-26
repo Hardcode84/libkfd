@@ -1,3 +1,6 @@
+kfd_add_test(quake_raster_api_test quake_raster_api_test.cpp)
+target_link_libraries(quake_raster_api_test PRIVATE quake_raster)
+
 kfd_add_device_test(context_test context_test.cpp)
 kfd_add_device_test(event_test event_test.cpp)
 kfd_add_device_test(memory_test memory_test.cpp)

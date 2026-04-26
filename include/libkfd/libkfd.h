@@ -19,7 +19,6 @@
 #include "libkfd/loader.h"
 #include "libkfd/memory.h"
 #include "libkfd/queue.h"
-#include "libkfd/quake_raster.h"
 #include "libkfd/signal.h"
 #include "libkfd/topology.h"
 

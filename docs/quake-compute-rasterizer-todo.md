@@ -95,7 +95,8 @@ Exit criteria:
 - [x] Add depth buffer.
 - [x] Add visual debug modes: flat surface ID, depth, texture only, light only.
 - [x] Validate recognizable `e1m1` nooutput dump through the QrustyQuake
-  adapter.
+  adapter; see `quake-raster-validation.md` for the checked-in smoke script
+  and required release evidence.
 
 Exit criteria:
 

@@ -5,6 +5,7 @@
 #include "libkfd/gpu.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1503,6 +1504,49 @@ static qr_raster_vertex qr_make_raster_vertex(const qr_world_vertex *vertex)
   return out;
 }
 
+static int qr_valid_world_vertex(const qr_world_vertex *vertex)
+{
+  return vertex != NULL && isfinite(vertex->x) && isfinite(vertex->y) &&
+         isfinite(vertex->z) && isfinite(vertex->u) && isfinite(vertex->v) &&
+         isfinite(vertex->light_u) && isfinite(vertex->light_v);
+}
+
+static int qr_valid_alias_triangle_desc(const qr_alias_triangle_desc *triangle)
+{
+  return triangle != NULL && qr_valid_world_vertex(&triangle->v0) &&
+         qr_valid_world_vertex(&triangle->v1) &&
+         qr_valid_world_vertex(&triangle->v2);
+}
+
+static int qr_valid_sprite_desc(const qr_sprite_draw_desc *desc)
+{
+  return desc != NULL && isfinite(desc->x0) && isfinite(desc->y0) &&
+         isfinite(desc->x1) && isfinite(desc->y1) && isfinite(desc->z) &&
+         isfinite(desc->u0) && isfinite(desc->v0) && isfinite(desc->u1) &&
+         isfinite(desc->v1) && isfinite(desc->time_seconds);
+}
+
+static int qr_valid_particle_desc(const qr_particle_desc *particle)
+{
+  return particle != NULL && isfinite(particle->x) && isfinite(particle->y) &&
+         isfinite(particle->z) && isfinite(particle->size) &&
+         isfinite(particle->u) && isfinite(particle->v) &&
+         particle->size > 0.0f;
+}
+
+static int qr_valid_float4(const float values[4])
+{
+  return values != NULL && isfinite(values[0]) && isfinite(values[1]) &&
+         isfinite(values[2]) && isfinite(values[3]);
+}
+
+static int qr_valid_surface_desc(const qr_world_surface_desc *surface)
+{
+  return surface != NULL && qr_valid_float4(surface->plane) &&
+         qr_valid_float4(surface->tex_s) && qr_valid_float4(surface->tex_t) &&
+         qr_valid_float4(surface->light_s) && qr_valid_float4(surface->light_t);
+}
+
 static int qr_valid_debug_mode(qr_debug_mode mode)
 {
   switch (mode) {
@@ -1593,7 +1637,8 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   uint64_t end_ns;
   int err;
 
-  if (ctx == NULL || qr_valid_debug_mode(debug_mode) == 0) {
+  if (ctx == NULL || qr_valid_debug_mode(debug_mode) == 0 ||
+      !isfinite(time_seconds)) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
   if (debug_mode == QR_DEBUG_SHADED &&
@@ -1702,7 +1747,8 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
   ctx = frame->ctx;
   if (ctx->frame_active == 0 || desc->world == QR_INVALID_HANDLE ||
       desc->world > ctx->world_count ||
-      qr_valid_debug_mode(desc->debug_mode) == 0) {
+      qr_valid_debug_mode(desc->debug_mode) == 0 ||
+      !isfinite(desc->time_seconds)) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
   if (desc->debug_mode == QR_DEBUG_SHADED &&
@@ -1725,6 +1771,11 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
     if (polygon->vertices == NULL || polygon->vertex_count < 3U ||
         polygon->surface >= world->surface_count) {
       return QR_ERROR_INVALID_ARGUMENT;
+    }
+    for (uint32_t j = 0U; j < polygon->vertex_count; ++j) {
+      if (qr_valid_world_vertex(&polygon->vertices[j]) == 0) {
+        return QR_ERROR_INVALID_ARGUMENT;
+      }
     }
     if (triangle_count > SIZE_MAX - ((size_t)polygon->vertex_count - 2U)) {
       return QR_ERROR_OVERFLOW;
@@ -1810,7 +1861,8 @@ qr_result qr_frame_draw_sprite(qr_frame *frame,
   ctx = frame->ctx;
   if (ctx->frame_active == 0 || desc->world == QR_INVALID_HANDLE ||
       desc->world > ctx->world_count ||
-      qr_valid_debug_mode(desc->debug_mode) == 0) {
+      qr_valid_debug_mode(desc->debug_mode) == 0 ||
+      qr_valid_sprite_desc(desc) == 0) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
   world = &ctx->worlds[desc->world];
@@ -1849,7 +1901,8 @@ qr_result qr_frame_draw_particles(qr_frame *frame,
     return QR_ERROR_INVALID_ARGUMENT;
   }
   ctx = frame->ctx;
-  if (ctx->frame_active == 0 || qr_valid_debug_mode(desc->debug_mode) == 0) {
+  if (ctx->frame_active == 0 || qr_valid_debug_mode(desc->debug_mode) == 0 ||
+      !isfinite(desc->time_seconds)) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
   if (desc->particle_count == 0U) {
@@ -1875,12 +1928,13 @@ qr_result qr_frame_draw_particles(qr_frame *frame,
     float y1;
     uint32_t surface;
 
-    if (particle->world == QR_INVALID_HANDLE ||
+    if (qr_valid_particle_desc(particle) == 0 ||
+        particle->world == QR_INVALID_HANDLE ||
         particle->world > ctx->world_count) {
       return QR_ERROR_INVALID_ARGUMENT;
     }
     world = &ctx->worlds[particle->world];
-    if (particle->surface >= world->surface_count || particle->size <= 0.0f) {
+    if (particle->surface >= world->surface_count) {
       return QR_ERROR_INVALID_ARGUMENT;
     }
     half_size = particle->size * 0.5f;
@@ -2304,7 +2358,8 @@ qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces
     if (src->texture == QR_INVALID_HANDLE ||
         src->texture > ctx->texture_count ||
         src->lightmap == QR_INVALID_HANDLE ||
-        src->lightmap > ctx->lightmap_count) {
+        src->lightmap > ctx->lightmap_count ||
+        qr_valid_surface_desc(src) == 0) {
       return QR_ERROR_INVALID_ARGUMENT;
     }
   }
@@ -2362,7 +2417,8 @@ qr_result qr_upload_alias_model(qr_context *ctx,
 
   world = &ctx->worlds[desc->world];
   for (i = 0U; i < desc->triangle_count; ++i) {
-    if (desc->triangles[i].surface >= world->surface_count) {
+    if (desc->triangles[i].surface >= world->surface_count ||
+        qr_valid_alias_triangle_desc(&desc->triangles[i]) == 0) {
       return QR_ERROR_INVALID_ARGUMENT;
     }
   }

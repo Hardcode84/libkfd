@@ -1,0 +1,34 @@
+name: libkfd
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - no-gapi
+
+jobs:
+  host-quake-raster:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config libdrm-dev wget lsb-release software-properties-common
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/ci -G Ninja \
+            -DCMAKE_C_COMPILER=/usr/bin/clang-21 \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++-21 \
+            -DLIBKFD_BUILD_TESTS=ON
+
+      - name: Build host validation
+        run: cmake --build build/ci --target quake_raster_api_test quake_raster_diff
+
+      - name: Run host validation
+        run: ctest --test-dir build/ci/tests/core -R "Quake raster API" --output-on-failure
