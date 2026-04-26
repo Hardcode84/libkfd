@@ -423,6 +423,145 @@ TEST_CASE("Quake raster - handles classic surface flags and light updates",
   qr_destroy(ctx);
 }
 
+TEST_CASE("Quake raster - draws alias models, sprites, and particles",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 8;
+  constexpr std::uint32_t HEIGHT = 8;
+  const std::array<std::uint8_t, 4> texture{55, 55, 55, 55};
+  const std::array<std::uint8_t, 4> light{1, 1, 1, 1};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .max_frame_triangles = 8,
+      .max_alias_models = 1,
+      .max_alias_triangles = 1,
+      .texture_atlas_bytes = texture.size(),
+      .lightmap_atlas_bytes = light.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_alias_model alias = QR_INVALID_HANDLE;
+  qr_texture_desc tex_desc{
+      .mips =
+          {
+              {.pixels = texture.data(), .width = 2, .height = 2, .stride = 2},
+          },
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = light.data(),
+      .width = 2,
+      .height = 2,
+      .stride = 2,
+  };
+  qr_world_surface_desc surface{};
+  qr_alias_triangle_desc tri{
+      .surface = 0,
+      .v0 = {.x = 0.0F, .y = 0.0F, .z = 0.4F, .u = 0.0F, .v = 0.0F,
+             .light_u = 0.0F, .light_v = 0.0F},
+      .v1 = {.x = 4.0F, .y = 0.0F, .z = 0.4F, .u = 2.0F, .v = 0.0F,
+             .light_u = 1.0F, .light_v = 0.0F},
+      .v2 = {.x = 0.0F, .y = 4.0F, .z = 0.4F, .u = 0.0F, .v = 2.0F,
+             .light_u = 0.0F, .light_v = 1.0F},
+  };
+  qr_alias_model_desc alias_desc{
+      .world = QR_INVALID_HANDLE,
+      .triangles = &tri,
+      .triangle_count = 1,
+  };
+  std::array<std::uint8_t, WIDTH * HEIGHT> pixels{};
+  qr_frame_desc frame_desc{};
+
+  REQUIRE(qr_upload_texture(ctx, &tex_desc, &tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surface.texture = tex;
+  surface.lightmap = lm;
+  REQUIRE(qr_create_world(ctx, &surface, 1, &world) == QR_SUCCESS);
+  alias_desc.world = world;
+  REQUIRE(qr_upload_alias_model(ctx, &alias_desc, &alias) == QR_SUCCESS);
+  {
+    qr_alias_model overflow_alias = QR_INVALID_HANDLE;
+    CHECK(qr_upload_alias_model(ctx, &alias_desc, &overflow_alias) ==
+          QR_ERROR_NO_SPACE);
+    CHECK(overflow_alias == QR_INVALID_HANDLE);
+  }
+
+  {
+    qr_frame *frame = nullptr;
+    qr_alias_draw_desc draw{
+        .model = alias,
+        .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+    };
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_alias_model(frame, &draw) == QR_SUCCESS);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+    REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+            QR_SUCCESS);
+    CHECK(pixels[0] == 55);
+  }
+
+  {
+    qr_frame *frame = nullptr;
+    qr_sprite_draw_desc draw{
+        .world = world,
+        .surface = 0,
+        .x0 = 4.0F,
+        .y0 = 0.0F,
+        .x1 = 8.0F,
+        .y1 = 4.0F,
+        .z = 0.3F,
+        .u0 = 0.0F,
+        .v0 = 0.0F,
+        .u1 = 2.0F,
+        .v1 = 2.0F,
+        .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+    };
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_sprite(frame, &draw) == QR_SUCCESS);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+    REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+            QR_SUCCESS);
+    CHECK(pixels[4] == 55);
+  }
+
+  {
+    qr_frame *frame = nullptr;
+    std::array<qr_particle_desc, 1> particles{{
+        {.world = world, .surface = 0, .x = 6.0F, .y = 6.0F, .z = 0.2F,
+         .size = 2.0F, .u = 0.0F, .v = 0.0F},
+    }};
+    qr_particles_draw_desc draw{
+        .particles = particles.data(),
+        .particle_count = particles.size(),
+        .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+    };
+
+    REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+    REQUIRE(qr_frame_clear_indexed(frame, 0) == QR_SUCCESS);
+    REQUIRE(qr_frame_draw_particles(frame, &draw) == QR_SUCCESS);
+    REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+    REQUIRE(qr_read_indexed(ctx, pixels.data(), pixels.size(), WIDTH) ==
+            QR_SUCCESS);
+    CHECK(pixels[static_cast<std::size_t>(6) * WIDTH + 6U] == 55);
+  }
+
+  qr_destroy(ctx);
+}
+
 TEST_CASE("Quake raster - uploads synthetic persistent resources",
           "[quake_raster][device]") {
   qr_context *ctx = nullptr;

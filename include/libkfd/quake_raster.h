@@ -19,7 +19,7 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 7U
+#define QR_API_VERSION_MINOR 8U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
@@ -68,6 +68,7 @@ typedef enum qr_debug_mode {
 typedef uint32_t qr_texture;
 typedef uint32_t qr_lightmap;
 typedef uint32_t qr_world;
+typedef uint32_t qr_alias_model;
 
 typedef qr_result (*qr_present_callback)(void *userdata, const uint32_t *xrgb,
                                          uint32_t width, uint32_t height,
@@ -88,6 +89,8 @@ typedef struct qr_desc {
   uint32_t max_surfaces;
   uint32_t max_worlds;
   uint32_t max_frame_triangles;
+  uint32_t max_alias_models;
+  uint32_t max_alias_triangles;
   size_t texture_atlas_bytes;
   size_t lightmap_atlas_bytes;
 } qr_desc;
@@ -153,6 +156,65 @@ typedef struct qr_world_draw_desc {
   float time_seconds;
 } qr_world_draw_desc;
 
+typedef struct qr_alias_triangle_desc {
+  uint32_t surface;
+  qr_world_vertex v0;
+  qr_world_vertex v1;
+  qr_world_vertex v2;
+} qr_alias_triangle_desc;
+
+typedef struct qr_alias_model_desc {
+  qr_world world;
+  const qr_alias_triangle_desc *triangles;
+  size_t triangle_count;
+} qr_alias_model_desc;
+
+typedef struct qr_alias_draw_desc {
+  qr_alias_model model;
+  const uint8_t *colormap;
+  size_t colormap_size;
+  qr_debug_mode debug_mode;
+  float time_seconds;
+} qr_alias_draw_desc;
+
+typedef struct qr_sprite_draw_desc {
+  qr_world world;
+  uint32_t surface;
+  float x0;
+  float y0;
+  float x1;
+  float y1;
+  float z;
+  float u0;
+  float v0;
+  float u1;
+  float v1;
+  const uint8_t *colormap;
+  size_t colormap_size;
+  qr_debug_mode debug_mode;
+  float time_seconds;
+} qr_sprite_draw_desc;
+
+typedef struct qr_particle_desc {
+  qr_world world;
+  uint32_t surface;
+  float x;
+  float y;
+  float z;
+  float size;
+  float u;
+  float v;
+} qr_particle_desc;
+
+typedef struct qr_particles_draw_desc {
+  const qr_particle_desc *particles;
+  size_t particle_count;
+  const uint8_t *colormap;
+  size_t colormap_size;
+  qr_debug_mode debug_mode;
+  float time_seconds;
+} qr_particles_draw_desc;
+
 typedef struct qr_capacity_info {
   uint32_t texture_count;
   uint32_t texture_capacity;
@@ -167,6 +229,10 @@ typedef struct qr_capacity_info {
   uint32_t world_count;
   uint32_t world_capacity;
   uint32_t frame_triangle_capacity;
+  uint32_t alias_model_count;
+  uint32_t alias_model_capacity;
+  uint32_t alias_triangle_count;
+  uint32_t alias_triangle_capacity;
 } qr_capacity_info;
 
 typedef struct qr_raster_stats {
@@ -227,6 +293,12 @@ qr_result qr_begin_frame(qr_context *ctx, const qr_frame_desc *desc,
                          qr_frame **out);
 qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color);
 qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc);
+qr_result qr_frame_draw_alias_model(qr_frame *frame,
+                                    const qr_alias_draw_desc *desc);
+qr_result qr_frame_draw_sprite(qr_frame *frame,
+                               const qr_sprite_draw_desc *desc);
+qr_result qr_frame_draw_particles(qr_frame *frame,
+                                  const qr_particles_draw_desc *desc);
 qr_result qr_end_frame(qr_frame *frame);
 
 /*
@@ -256,6 +328,9 @@ qr_result qr_update_lightmap(qr_context *ctx, qr_lightmap lightmap,
                              const qr_lightmap_desc *desc);
 qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
                           size_t surface_count, qr_world *out);
+qr_result qr_upload_alias_model(qr_context *ctx,
+                                const qr_alias_model_desc *desc,
+                                qr_alias_model *out);
 qr_result qr_get_capacity_info(qr_context *ctx, qr_capacity_info *out);
 
 /*

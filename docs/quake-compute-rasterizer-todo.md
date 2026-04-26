@@ -158,12 +158,12 @@ Exit criteria:
 
 ## Milestone 10: Entities
 
-- [ ] Alias model resource upload.
-- [ ] Alias model command buffer.
-- [ ] Alias triangle setup/raster path.
-- [ ] Sprite command/raster path.
-- [ ] Particle command/raster path.
-- [ ] Use packed atomic or separate ordered passes where world ordering no
+- [x] Alias model resource upload.
+- [x] Alias model command buffer.
+- [x] Alias triangle setup/raster path.
+- [x] Sprite command/raster path.
+- [x] Particle command/raster path.
+- [x] Use packed atomic or separate ordered passes where world ordering no
   longer applies.
 
 Exit criteria:
