@@ -28,6 +28,24 @@ not a good long-term architecture:
 
 The next renderer should submit scene-level draw work, not CPU span internals.
 
+## Prior Art Baseline
+
+The renderer is a tile-based deferred renderer implemented with compute kernels.
+Its closest references are:
+
+- NVIDIA `cudaraster` (Laine and Karras, HPG 2011): a full CUDA graphics
+  pipeline with multi-level binning.
+- TU Graz `cuRE` (Kenzel, Kerbl, Schmalstieg, Steinberger, SIGGRAPH 2018): a
+  later GPU compute graphics pipeline with streaming stages and bounded memory.
+- Larrabee/OpenSWR/llvmpipe/mobile TBDRs: production examples of tile-based
+  software or hardware rasterization.
+
+The Quake renderer should borrow the broad architecture, not the full generality.
+Quake has large polygons, cheap fixed shading, no MSAA requirement, no arbitrary
+shader programs, and CPU-side BSP/PVS visibility. This puts it in the
+large-triangle, cheap-shader TBDR regime, not the Nanite micro-polygon regime
+and not the voxel/ray-search regime.
+
 ## Target Architecture
 
 Keep Quake game code and visibility on the CPU. Move raster ownership to GPU.
@@ -143,13 +161,19 @@ important rule is that the CPU should not generate final spans or pixels.
 
 ### 3. Tiled Binning
 
-Raster work should be binned into screen tiles, for example `8x8` or `16x16`.
+Raster work should be binned into `16x16` screen tiles for the MVP.
 
 ```text
 primitive records
   -> tile primitive lists
   -> one or more workgroups per tile
 ```
+
+`16x16` is the default because it maps well to AMD wave32 execution:
+256 pixels per tile gives enough waves per tile to keep occupancy healthy while
+keeping tile-local metadata small. `8x8` can be useful later as a fine level
+under a coarse hierarchy, cudaraster-style, but it should not be the only MVP
+tile size.
 
 This gives the GPU coherent work and limits depth/color write contention.
 
@@ -162,7 +186,7 @@ Start simple:
 Optimize later:
 
 - Prefix-summed tile lists.
-- Hierarchical bins.
+- Coarse -> fine hierarchical bins.
 - Separate world/entity/particle bins.
 
 ### 4. Tiled Raster
@@ -184,7 +208,43 @@ For each covered pixel:
 The first implementation can use global memory for depth/color. Later versions
 can stage tile color/depth in LDS if profiling shows it helps.
 
-### 5. Resolve And Present
+### 5. Depth, Color, And Races
+
+AMDGPU has 32-bit and 64-bit atomics, not byte atomics. The renderer must not
+pretend an 8-bit framebuffer can be updated atomically by overlapping
+primitives.
+
+Use two policies:
+
+- Opaque world MVP: exploit CPU BSP/PVS ordering and tile-local primitive order.
+  Raster world surfaces in deterministic order within each tile. Use a normal
+  8-bit color store and a depth test/update policy that preserves the selected
+  world ordering. Validate this visually and with debug modes.
+- General entities and later mixed-order paths: use a packed 64-bit atomic path
+  when correctness needs race-free depth and color. Pack depth plus color or
+  primitive ID into one value, following the Nanite-style
+  `atomicMax/atomicMin(depth_and_payload)` pattern.
+
+Keep the indexed framebuffer as the canonical color target. If the packed atomic
+path stores IDs instead of color, shade those pixels in a later resolve pass only
+for the paths that need it. Do not turn the whole Quake world renderer into a
+visibility-buffer pipeline unless profiling proves it is needed.
+
+### 6. HiZ
+
+Add a per-tile hierarchical depth summary early.
+
+For the MVP, a simple `16x16` tile depth bound is enough:
+
+- Setup/raster records conservative depth bounds per tile.
+- Tile raster tests the bound before walking the full primitive list.
+- Opaque world surfaces can combine BSP order with tile depth bounds to reject
+  obvious hidden work.
+
+This should be treated as part of the world-raster architecture, not as a later
+micro-optimization.
+
+### 7. Resolve And Present
 
 The indexed framebuffer remains the renderer's canonical output.
 
@@ -285,6 +345,19 @@ struct TileHeader {
 };
 ```
 
+### Tile Depth
+
+```c
+struct TileDepth {
+	uint nearest_depth;
+	uint farthest_depth;
+};
+```
+
+Depth can start as `uint32_t` fixed-point or float-bit ordered depth, whichever
+gets the MVP running fastest. Exact WinQuake Z behavior is less important than a
+stable ordering policy and a debug mode that makes disagreements visible.
+
 The exact layout should be tuned for AMDGPU memory access, but all buffers should
 remain plain C-compatible arrays.
 
@@ -379,7 +452,9 @@ Prioritize architectural wins:
 - No per-frame texture repacking.
 - No CPU span generation.
 - No GPU framebuffer readback.
-- Coherent tile-local raster work.
+- Coherent `16x16` tile-local raster work.
+- Explicit color/depth race policy.
+- Per-tile HiZ/depth bounds.
 - Large dispatches with enough occupancy.
 - Minimal CPU/GPU synchronization.
 
@@ -411,28 +486,39 @@ Avoid spending time on:
 - Write 8-bit framebuffer and depth.
 - Support texture atlas and static lightmap sampling.
 - Present through existing palette conversion path.
+- Choose and validate the opaque-world color/depth ordering policy.
 
 ### Stage D: Tiled Raster
 
-- Add tile bins.
+- Add `16x16` tile bins.
 - Dispatch one or more workgroups per tile.
 - Move world raster to tile lists.
+- Add per-tile depth bounds / HiZ.
 - Compare perf against Stage C.
 
-### Stage E: Classic Features
+### Stage E: Hierarchical Binning
+
+- Add a coarse bin level above `16x16` tiles if large world polygons make
+  primitive x tile counts expensive.
+- Use bounded overflow lists from the start.
+- Treat cudaraster/cuRE as the reference shape for coarse -> fine binning.
+
+### Stage F: Classic Features
 
 - Sky.
 - Water turbulence.
 - Animated light styles and dirty lightmaps.
 - Transparent/cutout surfaces.
 
-### Stage F: Entities
+### Stage G: Entities
 
 - Alias models.
 - Sprites.
 - Particles.
+- Use the packed atomic path for entity/transparent cases that cannot rely on
+  opaque world ordering.
 
-### Stage G: Cleanup
+### Stage H: Cleanup
 
 - Remove old span experiment from the main path.
 - Keep debug cvars for fallback/comparison only.
@@ -443,9 +529,9 @@ Avoid spending time on:
 
 - Should clipping be CPU-side for the first world MVP, or should setup generate
   conservative screen bounds and let raster kernels reject pixels?
-- Is `8x8` or `16x16` the better tile size for target AMD hardware?
-- Should depth be fixed-point to match Quake-style `z` behavior or floating
-  initially for simpler bring-up?
+- Can opaque world color stores safely rely on BSP/tile-local order, or do some
+  maps/surfaces require packed atomics even for world rendering?
+- Should depth be fixed-point or float-bit ordered for the first MVP?
 - How much exactness is required for edge fill rules before visual differences
   become noticeable?
 - Should UI remain CPU-rendered into an indexed overlay, or should it become
