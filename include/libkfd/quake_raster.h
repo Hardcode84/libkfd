@@ -79,6 +79,20 @@ typedef qr_result (*qr_present_callback)(void *userdata, const uint32_t *xrgb,
                                          uint32_t width, uint32_t height,
                                          size_t stride_pixels);
 
+typedef struct qr_present_surface_desc {
+  uint32_t index;
+  int dmabuf_fd;
+  size_t size;
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+} qr_present_surface_desc;
+
+typedef qr_result (*qr_present_surface_callback)(
+    void *userdata, const qr_present_surface_desc *surface);
+typedef qr_result (*qr_prepare_present_surface_callback)(
+    void *userdata, const qr_present_surface_desc *surface);
+
 typedef struct qr_desc {
   uint32_t width;
   uint32_t height;
@@ -88,6 +102,9 @@ typedef struct qr_desc {
   qr_present_callback present;
   void *present_userdata;
   const uint32_t *present_palette_xrgb;
+  qr_prepare_present_surface_callback prepare_present_surface;
+  qr_present_surface_callback present_surface;
+  uint32_t present_buffer_count;
   /* Zero capacity/budget fields select renderer defaults. */
   uint32_t max_textures;
   uint32_t max_lightmaps;
@@ -382,6 +399,8 @@ qr_result qr_upload_lightmap(qr_context *ctx, const qr_lightmap_desc *desc,
                              qr_lightmap *out);
 qr_result qr_update_lightmap(qr_context *ctx, qr_lightmap lightmap,
                              const qr_lightmap_desc *desc);
+qr_result qr_update_present_palette(qr_context *ctx,
+                                    const uint32_t *palette_xrgb);
 qr_result qr_create_world(qr_context *ctx, const qr_world_surface_desc *surfaces,
                           size_t surface_count, qr_world *out);
 qr_result qr_upload_alias_model(qr_context *ctx,

@@ -266,8 +266,13 @@ struct qr_context {
   uint32_t alias_triangle_count;
   qr_output_mode output_mode;
   qr_present_callback present;
+  qr_prepare_present_surface_callback prepare_present_surface;
+  qr_present_surface_callback present_surface;
   void *present_userdata;
   uint32_t present_palette_xrgb[256];
+  kfd_gpu_surface **present_surfaces;
+  uint32_t present_buffer_count;
+  uint32_t present_buffer_index;
   qr_perf_counters perf;
   struct qr_frame frame;
   int frame_active;
@@ -424,8 +429,17 @@ static int qr_validate_desc(const qr_desc *desc)
       desc->output_mode != QR_OUTPUT_PRESENT) {
     return ENOTSUP;
   }
+  if (desc->output_mode == QR_OUTPUT_PRESENT && desc->present == NULL &&
+      desc->present_surface == NULL) {
+    return EINVAL;
+  }
   if (desc->output_mode == QR_OUTPUT_PRESENT &&
-      (desc->present == NULL || desc->present_palette_xrgb == NULL)) {
+      desc->present_surface != NULL &&
+      desc->prepare_present_surface == NULL) {
+    return EINVAL;
+  }
+  if (desc->output_mode == QR_OUTPUT_PRESENT && desc->present != NULL &&
+      desc->present_palette_xrgb == NULL) {
     return EINVAL;
   }
   if (desc->framebuffer_format != QR_FRAMEBUFFER_INDEXED8) {
@@ -594,6 +608,12 @@ static void qr_destroy_resolve_kernel(qr_context *ctx)
   kfd_gpu_module_destroy(ctx->resolve_module);
   kfd_gpu_buffer_destroy(ctx->resolve_palette);
   kfd_gpu_buffer_destroy(ctx->xrgb);
+  if (ctx->present_surfaces != NULL) {
+    for (uint32_t i = 0; i < ctx->present_buffer_count; ++i) {
+      kfd_gpu_surface_destroy(ctx->present_surfaces[i]);
+    }
+  }
+  qr_free_bytes(ctx->present_surfaces);
   ctx->resolve_fence = NULL;
   ctx->resolve_kernarg = NULL;
   ctx->resolve_root = NULL;
@@ -601,6 +621,9 @@ static void qr_destroy_resolve_kernel(qr_context *ctx)
   ctx->resolve_module = NULL;
   ctx->resolve_palette = NULL;
   ctx->xrgb = NULL;
+  ctx->present_surfaces = NULL;
+  ctx->present_buffer_count = 0;
+  ctx->present_buffer_index = 0;
 }
 
 static void qr_destroy_raster_kernel(qr_context *ctx)
@@ -749,6 +772,27 @@ static int qr_load_resolve_kernel(qr_context *ctx)
                               &ctx->xrgb);
   if (err != 0) {
     return err;
+  }
+  if (ctx->output_mode == QR_OUTPUT_PRESENT && ctx->present_surface != NULL) {
+    uint32_t count = ctx->present_buffer_count != 0U ? ctx->present_buffer_count
+                                                     : 2U;
+
+    ctx->present_surfaces =
+        (kfd_gpu_surface **)qr_calloc_bytes(count, sizeof(*ctx->present_surfaces));
+    if (ctx->present_surfaces == NULL) {
+      qr_destroy_resolve_kernel(ctx);
+      return ENOMEM;
+    }
+    ctx->present_buffer_count = count;
+    for (uint32_t i = 0; i < count; ++i) {
+      err = kfd_gpu_surface_create(ctx->gpu, ctx->width, ctx->height,
+                                   KFD_GPU_FORMAT_XRGB8,
+                                   &ctx->present_surfaces[i]);
+      if (err != 0) {
+        qr_destroy_resolve_kernel(ctx);
+        return err;
+      }
+    }
   }
   err = kfd_gpu_buffer_create(ctx->gpu, 256U * sizeof(uint32_t),
                               KFD_GPU_MEMORY_UPLOAD,
@@ -1115,9 +1159,11 @@ static int qr_load_raster_kernel(qr_context *ctx)
 }
 
 static int qr_dispatch_resolve_xrgb(qr_context *ctx,
-                                    const uint32_t *palette_xrgb)
+                                    const uint32_t *palette_xrgb,
+                                    void *dst_gpu)
 {
   void *palette_dst;
+  qr_resolve_xrgb_args *args;
   uint64_t start_ns;
   int err;
 
@@ -1129,6 +1175,12 @@ static int qr_dispatch_resolve_xrgb(qr_context *ctx,
     return EIO;
   }
   memcpy(palette_dst, palette_xrgb, 256U * sizeof(uint32_t));
+  args = (qr_resolve_xrgb_args *)kfd_gpu_buffer_cpu(ctx->resolve_root);
+  if (args == NULL) {
+    return EIO;
+  }
+  args->dst = (uint32_t *)(dst_gpu != NULL ? dst_gpu
+                                           : kfd_gpu_buffer_gpu(ctx->xrgb));
   start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(ctx->gpu, ctx->resolve_kernel,
                          &ctx->resolve_dispatch, ctx->resolve_kernarg,
@@ -1387,6 +1439,9 @@ qr_result qr_create(const qr_desc *desc, qr_context **out)
   ctx->xrgb_bytes = xrgb_bytes;
   ctx->output_mode = desc->output_mode;
   ctx->present = desc->present;
+  ctx->prepare_present_surface = desc->prepare_present_surface;
+  ctx->present_surface = desc->present_surface;
+  ctx->present_buffer_count = desc->present_buffer_count;
   ctx->present_userdata = desc->present_userdata;
   if (desc->present_palette_xrgb != NULL) {
     memcpy(ctx->present_palette_xrgb, desc->present_palette_xrgb,
@@ -2113,9 +2168,48 @@ qr_result qr_end_frame(qr_frame *frame)
     return QR_ERROR_INVALID_ARGUMENT;
   }
   if (ctx->output_mode == QR_OUTPUT_PRESENT) {
+    if (ctx->present_surface != NULL) {
+      kfd_gpu_surface *surface;
+      qr_present_surface_desc desc;
+      uint32_t index;
+
+      if (ctx->present_surfaces == NULL || ctx->present_buffer_count == 0U) {
+        ctx->frame_active = 0;
+        return QR_ERROR_IO;
+      }
+      index = ctx->present_buffer_index % ctx->present_buffer_count;
+      surface = ctx->present_surfaces[index];
+      desc.index = index;
+      desc.dmabuf_fd = kfd_gpu_surface_dmabuf_fd(surface);
+      desc.size = kfd_gpu_surface_size(surface);
+      desc.width = kfd_gpu_surface_width(surface);
+      desc.height = kfd_gpu_surface_height(surface);
+      desc.stride = kfd_gpu_surface_stride(surface);
+      result = ctx->prepare_present_surface(ctx->present_userdata, &desc);
+      if (result != QR_SUCCESS) {
+        ctx->frame_active = 0;
+        return result;
+      }
+      err = qr_dispatch_resolve_xrgb(
+          ctx, ctx->present_palette_xrgb,
+          kfd_gpu_buffer_gpu(kfd_gpu_surface_buffer(surface)));
+      if (err != 0) {
+        ctx->frame_active = 0;
+        return qr_result_from_gpu_error(err);
+      }
+      result = ctx->present_surface(ctx->present_userdata, &desc);
+      if (result != QR_SUCCESS) {
+        ctx->frame_active = 0;
+        return result;
+      }
+      ctx->present_buffer_index = (index + 1U) % ctx->present_buffer_count;
+      ++ctx->perf.frame_count;
+      ctx->frame_active = 0;
+      return QR_SUCCESS;
+    }
     const uint32_t *xrgb;
 
-    err = qr_dispatch_resolve_xrgb(ctx, ctx->present_palette_xrgb);
+    err = qr_dispatch_resolve_xrgb(ctx, ctx->present_palette_xrgb, NULL);
     if (err != 0) {
       ctx->frame_active = 0;
       return qr_result_from_gpu_error(err);
@@ -2233,7 +2327,7 @@ qr_result qr_read_xrgb(qr_context *ctx, const uint32_t *palette_xrgb, void *dst,
   if (dst_size < required) {
     return QR_ERROR_BUFFER_TOO_SMALL;
   }
-  err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb);
+  err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb, NULL);
   if (err != 0) {
     return qr_result_from_gpu_error(err);
   }
@@ -2295,7 +2389,7 @@ qr_result qr_dump_xrgb(qr_context *ctx, const uint32_t *palette_xrgb,
   if (ctx == NULL || palette_xrgb == NULL || path == NULL) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
-  err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb);
+  err = qr_dispatch_resolve_xrgb(ctx, palette_xrgb, NULL);
   if (err != 0) {
     return qr_result_from_gpu_error(err);
   }
@@ -2492,6 +2586,17 @@ qr_result qr_update_lightmap(qr_context *ctx, qr_lightmap lightmap,
     return qr_result_from_errno(err);
   }
   ctx->perf.upload_bytes += (size_t)record->width * (size_t)record->height;
+  return QR_SUCCESS;
+}
+
+qr_result qr_update_present_palette(qr_context *ctx,
+                                    const uint32_t *palette_xrgb)
+{
+  if (ctx == NULL || palette_xrgb == NULL) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  memcpy(ctx->present_palette_xrgb, palette_xrgb,
+         sizeof(ctx->present_palette_xrgb));
   return QR_SUCCESS;
 }
 
