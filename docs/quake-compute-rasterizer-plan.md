@@ -64,6 +64,68 @@ The CPU should submit compact draw commands and dirty resource updates. The GPU
 should own transform, setup, rasterization, texture lookup, light lookup, depth,
 and final palette conversion.
 
+## Library Boundary
+
+The compute rasterizer should be isolated from the Quake codebase from the
+start. Treat QrustyQuake as the first frontend, not as the renderer's home.
+
+Suggested split:
+
+```text
+qrustyquake frontend
+  -> extracts Quake assets, visibility, entities, frame commands
+  -> calls quake_raster_* C API
+
+quake compute rasterizer library
+  -> owns GPU resources, command buffers, kernels, framebuffer, presenter
+  -> exposes headless and windowed output modes
+```
+
+The renderer library should not include `quakedef.h`, depend on Quake globals,
+or call Quake allocation/error APIs. Quake-specific conversion code may live in a
+thin adapter layer, but the renderer core should be reusable by tests, tools, and
+other frontends.
+
+The public API should be context-based:
+
+```c
+struct qr_context;
+struct qr_frame;
+
+int qr_create(const struct qr_desc *desc, struct qr_context **out);
+void qr_destroy(struct qr_context *ctx);
+int qr_begin_frame(struct qr_context *ctx, const struct qr_frame_desc *desc,
+	struct qr_frame **out);
+int qr_submit_world_surfaces(struct qr_frame *frame,
+	const struct qr_world_surface_cmd *cmds, size_t count);
+int qr_end_frame(struct qr_frame *frame);
+```
+
+All mutable renderer state should hang from `qr_context` or explicit frame
+objects. Avoid process-wide renderer globals.
+
+## Output Modes
+
+Output must be independent from rendering.
+
+Required modes:
+
+- `present`: render to an exportable DMA-BUF/XRGB surface and present it through
+  the platform presenter.
+- `nooutput`: render into GPU-owned dummy targets with no active window,
+  presenter, X11 connection, or SDL window requirement.
+- `dump`: optional diagnostic path that reads back selected buffers or writes a
+  frame dump for inspection.
+
+`nooutput` is required for headless systems, CI, deterministic perf runs, and
+offline validation. It should still execute the same setup/bin/raster/resolve
+passes as windowed mode. The only difference is that the final surface is not
+presented. When inspection is requested, the renderer should copy the indexed
+framebuffer or resolved XRGB target into a caller-provided buffer or dump file.
+
+Do not make renderer initialization depend on a window. Presentation should be a
+replaceable backend attached to an already-created renderer context.
+
 ## Visual Contract
 
 The renderer should preserve the classical Quake look by design:
@@ -465,30 +527,78 @@ Avoid spending time on:
 - Tiny dispatches per surface.
 - CPU-generated spans or chunks as the long-term representation.
 
+## C Implementation Guidelines
+
+The new renderer should use modern C style, not Quake's historical style.
+
+Language and build:
+
+- Write renderer core code in C99.
+- Build it as a separate library/target with an explicit C standard. The current
+  QrustyQuake Makefile and CMake files do not set `-std=...`; that is fine for
+  legacy Quake code, but the renderer target should compile with `-std=c99` or
+  the CMake equivalent.
+- Compile the renderer target with strict diagnostics, including `-Wall`,
+  `-Wextra`, `-Wpedantic`, and `-Werror` for supported compilers. Keep these
+  flags scoped to the renderer library so legacy Quake code does not block the
+  build.
+- Keep GPU kernel C constrained to what the AMDGPU kernel compiler accepts; host
+  renderer code can still be C99.
+
+State and ownership:
+
+- No renderer global variables.
+- Use explicit `qr_context`, `qr_frame`, resource, and arena objects.
+- Make ownership clear in function names and API docs.
+- Prefer caller-provided storage or renderer-owned arenas over scattered heap
+  allocation.
+- Avoid `malloc` in per-frame paths. Ideally allocate all steady-state buffers at
+  context creation or level load.
+- If dynamic growth is unavoidable, route it through a small allocator/arena
+  owned by the renderer context and expose capacity telemetry.
+
+Coding style:
+
+- Use fixed-width integer types at API and GPU boundary points.
+- Keep structs plain C-compatible and layout-conscious.
+- Return error codes instead of exiting the process.
+- Keep platform-specific code behind backend interfaces.
+- Keep Quake adapter code separate from reusable renderer code.
+- Prefer small, explicit functions over macro-heavy historical Quake patterns.
+
 ## Implementation Roadmap
 
-### Stage A: Resource Builder
+### Stage A: Renderer Library Skeleton
+
+- Create the isolated renderer library target.
+- Add explicit C99 build settings for that target.
+- Define `qr_context`, frame objects, output backend interfaces, and error
+  codes.
+- Implement `nooutput` mode before windowed presentation integration.
+- Add a headless smoke test that renders or clears a dummy framebuffer.
+
+### Stage B: Resource Builder
 
 - Build GPU texture atlas from Quake textures and mips.
 - Build GPU world surface metadata.
 - Build static lightmap atlas.
 - Keep resources persistent across frames.
 
-### Stage B: World Command Buffer
+### Stage C: World Command Buffer
 
 - Emit visible world surface IDs from the existing BSP/PVS path.
 - Upload one compact command buffer per frame.
 - Keep old renderer available as fallback.
 
-### Stage C: Minimal World Raster
+### Stage D: Minimal World Raster
 
 - Raster world polygons directly, without tile binning if necessary.
 - Write 8-bit framebuffer and depth.
 - Support texture atlas and static lightmap sampling.
-- Present through existing palette conversion path.
+- Resolve into either `nooutput` or present output mode.
 - Choose and validate the opaque-world color/depth ordering policy.
 
-### Stage D: Tiled Raster
+### Stage E: Tiled Raster
 
 - Add `16x16` tile bins.
 - Dispatch one or more workgroups per tile.
@@ -496,21 +606,21 @@ Avoid spending time on:
 - Add per-tile depth bounds / HiZ.
 - Compare perf against Stage C.
 
-### Stage E: Hierarchical Binning
+### Stage F: Hierarchical Binning
 
 - Add a coarse bin level above `16x16` tiles if large world polygons make
   primitive x tile counts expensive.
 - Use bounded overflow lists from the start.
 - Treat cudaraster/cuRE as the reference shape for coarse -> fine binning.
 
-### Stage F: Classic Features
+### Stage G: Classic Features
 
 - Sky.
 - Water turbulence.
 - Animated light styles and dirty lightmaps.
 - Transparent/cutout surfaces.
 
-### Stage G: Entities
+### Stage H: Entities
 
 - Alias models.
 - Sprites.
@@ -518,7 +628,7 @@ Avoid spending time on:
 - Use the packed atomic path for entity/transparent cases that cannot rely on
   opaque world ordering.
 
-### Stage H: Cleanup
+### Stage I: Cleanup
 
 - Remove old span experiment from the main path.
 - Keep debug cvars for fallback/comparison only.
@@ -536,10 +646,15 @@ Avoid spending time on:
   become noticeable?
 - Should UI remain CPU-rendered into an indexed overlay, or should it become
   another GPU pass early?
+- What is the minimal dump format for headless inspection: raw indexed, XRGB,
+  PNG via a tool, or all of the above?
+- How strict should the no-heap-per-frame rule be for early bring-up versus the
+  production renderer?
 
 ## Recommendation
 
 Start with persistent world resources and a GPU-owned world raster path. Do not
 continue optimizing CPU span offload. The span experiment should remain as proof
 that `libkfd` presentation and simple compute kernels work, but the production
-renderer should use scene-level commands and tiled compute rasterization.
+renderer should be an isolated C99 library with scene-level commands, headless
+`nooutput` support, and tiled compute rasterization.
