@@ -237,7 +237,6 @@ struct qr_context {
   kfd_gpu_buffer *tile_depth_max;
   kfd_gpu_buffer *triangle_buffer;
   qr_raster_triangle *triangles;
-  uint32_t *triangulation_indices;
   uint32_t triangle_capacity;
   uint32_t tile_cols;
   uint32_t tile_rows;
@@ -1153,7 +1152,6 @@ static void qr_destroy_resources(qr_context *ctx)
   }
   qr_free_bytes(ctx->alias_triangles);
   qr_free_bytes(ctx->alias_models);
-  qr_free_bytes(ctx->triangulation_indices);
   qr_free_bytes(ctx->worlds);
   kfd_gpu_buffer_destroy(ctx->surface_metadata);
   kfd_gpu_buffer_destroy(ctx->lightmap_metadata);
@@ -1163,7 +1161,6 @@ static void qr_destroy_resources(qr_context *ctx)
   ctx->worlds = NULL;
   ctx->alias_models = NULL;
   ctx->alias_triangles = NULL;
-  ctx->triangulation_indices = NULL;
   ctx->lightmaps = NULL;
   ctx->textures = NULL;
   ctx->surface_metadata = NULL;
@@ -1250,10 +1247,7 @@ static int qr_init_resources(qr_context *ctx, const qr_desc *desc)
       alias_model_slots, sizeof(*ctx->alias_models));
   ctx->alias_triangles = (qr_alias_triangle_record *)qr_calloc_bytes(
       (size_t)ctx->alias_triangle_capacity, sizeof(*ctx->alias_triangles));
-  ctx->triangulation_indices = (uint32_t *)qr_calloc_bytes(
-      (size_t)ctx->triangle_capacity + 2U, sizeof(*ctx->triangulation_indices));
-  if (ctx->alias_models == NULL || ctx->alias_triangles == NULL ||
-      ctx->triangulation_indices == NULL) {
+  if (ctx->alias_models == NULL || ctx->alias_triangles == NULL) {
     qr_destroy_resources(ctx);
     return ENOMEM;
   }
@@ -1589,163 +1583,6 @@ static int qr_valid_debug_mode(qr_debug_mode mode)
   return 0;
 }
 
-static float qr_triangle_area2(const qr_world_vertex *a, const qr_world_vertex *b,
-                               const qr_world_vertex *c)
-{
-  return (b->x - a->x) * (c->y - a->y) -
-         (b->y - a->y) * (c->x - a->x);
-}
-
-static float qr_polygon_area2(const qr_world_vertex *vertices, uint32_t count)
-{
-  float area = 0.0f;
-  uint32_t i;
-
-  for (i = 0U; i < count; ++i) {
-    const qr_world_vertex *a = &vertices[i];
-    const qr_world_vertex *b = &vertices[(i + 1U) % count];
-
-    area += a->x * b->y - b->x * a->y;
-  }
-  return area;
-}
-
-static int qr_point_in_triangle_2d(const qr_world_vertex *p,
-                                   const qr_world_vertex *a,
-                                   const qr_world_vertex *b,
-                                   const qr_world_vertex *c, float winding)
-{
-  const float ab = qr_triangle_area2(a, b, p);
-  const float bc = qr_triangle_area2(b, c, p);
-  const float ca = qr_triangle_area2(c, a, p);
-
-  if (winding >= 0.0f) {
-    return ab >= -0.00001f && bc >= -0.00001f && ca >= -0.00001f;
-  }
-  return ab <= 0.00001f && bc <= 0.00001f && ca <= 0.00001f;
-}
-
-static void qr_emit_world_triangle(qr_raster_triangle *dst,
-                                   const qr_world_polygon_desc *polygon,
-                                   uint32_t first_surface, uint32_t a,
-                                   uint32_t b, uint32_t c)
-{
-  dst->v0 = qr_make_raster_vertex(&polygon->vertices[a]);
-  dst->v1 = qr_make_raster_vertex(&polygon->vertices[b]);
-  dst->v2 = qr_make_raster_vertex(&polygon->vertices[c]);
-  dst->surface = first_surface + polygon->surface;
-}
-
-static qr_result qr_triangulate_world_polygon(
-    const qr_world_polygon_desc *polygon, uint32_t first_surface,
-    qr_raster_triangle *triangles, size_t triangle_capacity, size_t *out_index,
-    uint32_t *indices)
-{
-  uint32_t remaining;
-  float winding;
-
-  if (polygon == NULL || triangles == NULL || out_index == NULL ||
-      indices == NULL) {
-    return QR_ERROR_INVALID_ARGUMENT;
-  }
-  if (polygon->vertex_count < 3U) {
-    return QR_ERROR_INVALID_ARGUMENT;
-  }
-  if (polygon->vertex_count == 3U) {
-    if (*out_index >= triangle_capacity) {
-      return QR_ERROR_NO_SPACE;
-    }
-    qr_emit_world_triangle(&triangles[(*out_index)++], polygon, first_surface,
-                           0U, 1U, 2U);
-    return QR_SUCCESS;
-  }
-
-  winding = qr_polygon_area2(polygon->vertices, polygon->vertex_count);
-  if (winding > -0.00001f && winding < 0.00001f) {
-    return QR_ERROR_INVALID_ARGUMENT;
-  }
-  for (uint32_t i = 0U; i < polygon->vertex_count; ++i) {
-    indices[i] = i;
-  }
-  remaining = polygon->vertex_count;
-  while (remaining > 3U) {
-    int found_ear = 0;
-    int removed_degenerate = 0;
-
-    for (uint32_t i = 0U; i < remaining; ++i) {
-      const uint32_t prev = indices[(i + remaining - 1U) % remaining];
-      const uint32_t curr = indices[i];
-      const uint32_t next = indices[(i + 1U) % remaining];
-      const float area =
-          qr_triangle_area2(&polygon->vertices[prev], &polygon->vertices[curr],
-                            &polygon->vertices[next]);
-      int contains_vertex = 0;
-
-      if ((winding > 0.0f && area <= 0.00001f) ||
-          (winding < 0.0f && area >= -0.00001f)) {
-        continue;
-      }
-      for (uint32_t j = 0U; j < remaining; ++j) {
-        const uint32_t candidate = indices[j];
-
-        if (candidate == prev || candidate == curr || candidate == next) {
-          continue;
-        }
-        if (qr_point_in_triangle_2d(&polygon->vertices[candidate],
-                                    &polygon->vertices[prev],
-                                    &polygon->vertices[curr],
-                                    &polygon->vertices[next], winding) != 0) {
-          contains_vertex = 1;
-          break;
-        }
-      }
-      if (contains_vertex != 0) {
-        continue;
-      }
-      if (*out_index >= triangle_capacity) {
-        return QR_ERROR_NO_SPACE;
-      }
-      qr_emit_world_triangle(&triangles[(*out_index)++], polygon, first_surface,
-                             prev, curr, next);
-      memmove(&indices[i], &indices[i + 1U],
-              (size_t)(remaining - i - 1U) * sizeof(*indices));
-      --remaining;
-      found_ear = 1;
-      break;
-    }
-    if (found_ear != 0) {
-      continue;
-    }
-
-    for (uint32_t i = 0U; i < remaining; ++i) {
-      const uint32_t prev = indices[(i + remaining - 1U) % remaining];
-      const uint32_t curr = indices[i];
-      const uint32_t next = indices[(i + 1U) % remaining];
-      const float area =
-          qr_triangle_area2(&polygon->vertices[prev], &polygon->vertices[curr],
-                            &polygon->vertices[next]);
-
-      if (area > -0.00001f && area < 0.00001f) {
-        memmove(&indices[i], &indices[i + 1U],
-                (size_t)(remaining - i - 1U) * sizeof(*indices));
-        --remaining;
-        removed_degenerate = 1;
-        break;
-      }
-    }
-    if (removed_degenerate == 0) {
-      return QR_ERROR_INVALID_ARGUMENT;
-    }
-  }
-
-  if (*out_index >= triangle_capacity) {
-    return QR_ERROR_NO_SPACE;
-  }
-  qr_emit_world_triangle(&triangles[(*out_index)++], polygon, first_surface,
-                         indices[0], indices[1], indices[2]);
-  return QR_SUCCESS;
-}
-
 static void qr_reset_raster_stats(qr_context *ctx)
 {
   if (ctx == NULL) {
@@ -1974,23 +1811,25 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
     return QR_ERROR_NO_SPACE;
   }
   triangles = ctx->triangles;
-  if (triangles == NULL || ctx->triangulation_indices == NULL) {
+  if (triangles == NULL) {
     return QR_ERROR_IO;
   }
 
   out_index = 0U;
   for (i = 0U; i < desc->polygon_count; ++i) {
     const qr_world_polygon_desc *polygon = &desc->polygons[i];
-    qr_result result;
+    uint32_t j;
 
-    result = qr_triangulate_world_polygon(
-        polygon, world->first_surface, triangles, ctx->triangle_capacity,
-        &out_index, ctx->triangulation_indices);
-    if (result != QR_SUCCESS) {
-      return result;
+    for (j = 1U; j + 1U < polygon->vertex_count; ++j) {
+      qr_raster_triangle *triangle = &triangles[out_index++];
+
+      triangle->v0 = qr_make_raster_vertex(&polygon->vertices[0]);
+      triangle->v1 = qr_make_raster_vertex(&polygon->vertices[j]);
+      triangle->v2 = qr_make_raster_vertex(&polygon->vertices[j + 1U]);
+      triangle->surface = world->first_surface + polygon->surface;
     }
   }
-  return qr_dispatch_prepared_triangles(ctx, out_index, desc->colormap,
+  return qr_dispatch_prepared_triangles(ctx, triangle_count, desc->colormap,
                                         desc->colormap_size, desc->debug_mode,
                                         desc->time_seconds);
 }
