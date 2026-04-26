@@ -215,6 +215,9 @@ struct qr_context {
   uint32_t world_capacity;
   uint32_t world_count;
   qr_output_mode output_mode;
+  qr_present_callback present;
+  void *present_userdata;
+  uint32_t present_palette_xrgb[256];
   struct qr_frame frame;
   int frame_active;
 };
@@ -355,8 +358,13 @@ static int qr_validate_desc(const qr_desc *desc)
   if (desc->width == 0U || desc->height == 0U) {
     return EINVAL;
   }
-  if (desc->output_mode != QR_OUTPUT_NOOUTPUT) {
+  if (desc->output_mode != QR_OUTPUT_NOOUTPUT &&
+      desc->output_mode != QR_OUTPUT_PRESENT) {
     return ENOTSUP;
+  }
+  if (desc->output_mode == QR_OUTPUT_PRESENT &&
+      (desc->present == NULL || desc->present_palette_xrgb == NULL)) {
+    return EINVAL;
   }
   if (desc->framebuffer_format != QR_FRAMEBUFFER_INDEXED8) {
     return ENOTSUP;
@@ -1259,6 +1267,12 @@ qr_result qr_create(const qr_desc *desc, qr_context **out)
   ctx->indexed_bytes = indexed_bytes;
   ctx->xrgb_bytes = xrgb_bytes;
   ctx->output_mode = desc->output_mode;
+  ctx->present = desc->present;
+  ctx->present_userdata = desc->present_userdata;
+  if (desc->present_palette_xrgb != NULL) {
+    memcpy(ctx->present_palette_xrgb, desc->present_palette_xrgb,
+           sizeof(ctx->present_palette_xrgb));
+  }
   ctx->frame.ctx = ctx;
   err = qr_init_resources(ctx, desc);
   if (err != 0) {
@@ -1607,13 +1621,38 @@ qr_result qr_frame_draw_world(qr_frame *frame, const qr_world_draw_desc *desc)
 
 qr_result qr_end_frame(qr_frame *frame)
 {
+  qr_context *ctx;
+  qr_result result;
+  int err;
+
   if (frame == NULL || frame->ctx == NULL) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
-  if (frame->ctx->frame_active == 0) {
+  ctx = frame->ctx;
+  if (ctx->frame_active == 0) {
     return QR_ERROR_INVALID_ARGUMENT;
   }
-  frame->ctx->frame_active = 0;
+  if (ctx->output_mode == QR_OUTPUT_PRESENT) {
+    const uint32_t *xrgb;
+
+    err = qr_dispatch_resolve_xrgb(ctx, ctx->present_palette_xrgb);
+    if (err != 0) {
+      ctx->frame_active = 0;
+      return qr_result_from_gpu_error(err);
+    }
+    xrgb = (const uint32_t *)kfd_gpu_buffer_cpu(ctx->xrgb);
+    if (xrgb == NULL) {
+      ctx->frame_active = 0;
+      return QR_ERROR_IO;
+    }
+    result = ctx->present(ctx->present_userdata, xrgb, ctx->width, ctx->height,
+                          ctx->width);
+    if (result != QR_SUCCESS) {
+      ctx->frame_active = 0;
+      return result;
+    }
+  }
+  ctx->frame_active = 0;
   return QR_SUCCESS;
 }
 

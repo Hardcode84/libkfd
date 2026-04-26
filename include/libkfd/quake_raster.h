@@ -19,7 +19,7 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 4U
+#define QR_API_VERSION_MINOR 5U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
@@ -65,12 +65,19 @@ typedef uint32_t qr_texture;
 typedef uint32_t qr_lightmap;
 typedef uint32_t qr_world;
 
+typedef qr_result (*qr_present_callback)(void *userdata, const uint32_t *xrgb,
+                                         uint32_t width, uint32_t height,
+                                         size_t stride_pixels);
+
 typedef struct qr_desc {
   uint32_t width;
   uint32_t height;
   size_t device_index;
   qr_output_mode output_mode;
   qr_framebuffer_format framebuffer_format;
+  qr_present_callback present;
+  void *present_userdata;
+  const uint32_t *present_palette_xrgb;
   /* Zero capacity/budget fields select renderer defaults. */
   uint32_t max_textures;
   uint32_t max_lightmaps;
@@ -181,6 +188,10 @@ uint64_t qr_pack_depth_payload(uint32_t depth_key, uint32_t payload);
  * Creates a renderer context. The context owns all GPU buffers, loaded kernels,
  * and synchronization objects it allocates. The caller owns only the returned
  * handle and must destroy it with qr_destroy().
+ *
+ * QR_OUTPUT_PRESENT uses the present callback in qr_desc. qr_create() copies
+ * the supplied 256-entry XRGB palette, and qr_end_frame() resolves the indexed
+ * framebuffer before invoking the callback with tightly packed XRGB rows.
  *
  * Contexts are not thread-safe. Calls that operate on the same qr_context or
  * qr_frame must be externally serialized by the caller.

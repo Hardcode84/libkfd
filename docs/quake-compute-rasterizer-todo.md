@@ -133,11 +133,11 @@ Exit criteria:
 
 ## Milestone 8: Present Mode
 
-- [ ] Add present output backend interface.
-- [ ] Reuse or factor existing DMA-BUF/X11 present code.
-- [ ] Keep `nooutput` as the default test path.
-- [ ] Add resolve-to-present-surface path.
-- [ ] Add windowed smoke test guarded by display availability.
+- [x] Add present output backend interface.
+- [x] Reuse or factor existing DMA-BUF/X11 present code.
+- [x] Keep `nooutput` as the default test path.
+- [x] Add resolve-to-present-surface path.
+- [x] Add windowed smoke test guarded by display availability.
 
 Exit criteria:
 

@@ -42,6 +42,29 @@ std::vector<std::uint8_t> read_binary_file(const std::filesystem::path &path) {
           std::istreambuf_iterator<char>()};
 }
 
+struct PresentCapture {
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::size_t stride = 0;
+  std::vector<std::uint32_t> pixels;
+  int calls = 0;
+};
+
+qr_result capture_present(void *userdata, const std::uint32_t *xrgb,
+                          std::uint32_t width, std::uint32_t height,
+                          std::size_t stride_pixels) {
+  auto *capture = static_cast<PresentCapture *>(userdata);
+  if (capture == nullptr || xrgb == nullptr || stride_pixels < width) {
+    return QR_ERROR_INVALID_ARGUMENT;
+  }
+  capture->width = width;
+  capture->height = height;
+  capture->stride = stride_pixels;
+  capture->pixels.assign(xrgb, xrgb + (stride_pixels * height));
+  ++capture->calls;
+  return QR_SUCCESS;
+}
+
 } // namespace
 
 TEST_CASE("Quake raster - exposes API version and error strings",
@@ -78,7 +101,7 @@ TEST_CASE("Quake raster - rejects invalid descriptors", "[quake_raster]") {
 
   desc.width = 16;
   desc.output_mode = QR_OUTPUT_PRESENT;
-  CHECK(qr_create(&desc, &ctx) == QR_ERROR_UNSUPPORTED);
+  CHECK(qr_create(&desc, &ctx) == QR_ERROR_INVALID_ARGUMENT);
 
   desc.output_mode = QR_OUTPUT_NOOUTPUT;
   desc.framebuffer_format = static_cast<qr_framebuffer_format>(99);
@@ -235,6 +258,45 @@ TEST_CASE("Quake raster - nooutput resolves XRGB for inspection",
   }
 
   std::filesystem::remove(path);
+  qr_destroy(ctx);
+}
+
+TEST_CASE("Quake raster - present mode resolves through callback",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 3;
+  constexpr std::uint32_t HEIGHT = 2;
+  constexpr std::uint8_t CLEAR_COLOR = 11;
+  constexpr std::uint32_t RESOLVED = 0xff445566U;
+  std::array<std::uint32_t, 256> palette{};
+  PresentCapture capture{};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_PRESENT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .present = capture_present,
+      .present_userdata = &capture,
+      .present_palette_xrgb = palette.data(),
+  };
+  qr_context *ctx = nullptr;
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+
+  palette[CLEAR_COLOR] = RESOLVED;
+  ctx = create_context_or_skip(desc);
+  REQUIRE(qr_output(ctx) == QR_OUTPUT_PRESENT);
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  REQUIRE(qr_frame_clear_indexed(frame, CLEAR_COLOR) == QR_SUCCESS);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
+  CHECK(capture.calls == 1);
+  CHECK(capture.width == WIDTH);
+  CHECK(capture.height == HEIGHT);
+  CHECK(capture.stride == WIDTH);
+  REQUIRE(capture.pixels.size() == WIDTH * HEIGHT);
+  CHECK(std::all_of(capture.pixels.begin(), capture.pixels.end(),
+                    [](std::uint32_t pixel) { return pixel == RESOLVED; }));
+
   qr_destroy(ctx);
 }
 
