@@ -12,6 +12,9 @@ out/
 # CMake user-local presets
 CMakeUserPresets.json
 
+# Local beads database/state
+.beads/
+
 # Editor / IDE
 *.swp
 *.swo
