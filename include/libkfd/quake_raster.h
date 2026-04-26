@@ -19,7 +19,7 @@ typedef struct qr_context qr_context;
 typedef struct qr_frame qr_frame;
 
 #define QR_API_VERSION_MAJOR 0U
-#define QR_API_VERSION_MINOR 6U
+#define QR_API_VERSION_MINOR 7U
 #define QR_API_VERSION_PATCH 0U
 #define QR_TEXTURE_MIP_COUNT 4U
 #define QR_INVALID_HANDLE 0U
@@ -87,6 +87,7 @@ typedef struct qr_desc {
   uint32_t max_lightmaps;
   uint32_t max_surfaces;
   uint32_t max_worlds;
+  uint32_t max_frame_triangles;
   size_t texture_atlas_bytes;
   size_t lightmap_atlas_bytes;
 } qr_desc;
@@ -165,6 +166,7 @@ typedef struct qr_capacity_info {
   uint32_t surface_capacity;
   uint32_t world_count;
   uint32_t world_capacity;
+  uint32_t frame_triangle_capacity;
 } qr_capacity_info;
 
 typedef struct qr_raster_stats {

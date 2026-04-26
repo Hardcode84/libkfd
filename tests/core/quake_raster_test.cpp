@@ -436,6 +436,7 @@ TEST_CASE("Quake raster - uploads synthetic persistent resources",
       .max_lightmaps = 2,
       .max_surfaces = 4,
       .max_worlds = 1,
+      .max_frame_triangles = 8,
       .texture_atlas_bytes = 64,
       .lightmap_atlas_bytes = 32,
   };
@@ -499,6 +500,7 @@ TEST_CASE("Quake raster - uploads synthetic persistent resources",
   CHECK(capacity.surface_capacity == 4);
   CHECK(capacity.world_count == 1);
   CHECK(capacity.world_capacity == 1);
+  CHECK(capacity.frame_triangle_capacity == 8);
 
   CHECK(qr_create_world(ctx, surfaces.data(), surfaces.size(), &world) ==
         QR_ERROR_NO_SPACE);
@@ -555,6 +557,83 @@ TEST_CASE("Quake raster - resource uploads reject undersized atlases",
   CHECK(qr_upload_lightmap(ctx, &lightmap_desc, &lightmap) ==
         QR_ERROR_NO_SPACE);
   CHECK(lightmap == QR_INVALID_HANDLE);
+
+  qr_destroy(ctx);
+}
+
+TEST_CASE("Quake raster - world draw rejects transient triangle overflow",
+          "[quake_raster][device]") {
+  constexpr std::uint32_t WIDTH = 4;
+  constexpr std::uint32_t HEIGHT = 4;
+  const std::array<std::uint8_t, WIDTH * HEIGHT> texture{
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+  const std::array<std::uint8_t, WIDTH * HEIGHT> light{
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+  qr_desc desc{
+      .width = WIDTH,
+      .height = HEIGHT,
+      .device_index = 0,
+      .output_mode = QR_OUTPUT_NOOUTPUT,
+      .framebuffer_format = QR_FRAMEBUFFER_INDEXED8,
+      .max_textures = 1,
+      .max_lightmaps = 1,
+      .max_surfaces = 1,
+      .max_worlds = 1,
+      .max_frame_triangles = 1,
+      .texture_atlas_bytes = texture.size(),
+      .lightmap_atlas_bytes = light.size(),
+  };
+  qr_context *ctx = create_context_or_skip(desc);
+  qr_texture tex = QR_INVALID_HANDLE;
+  qr_lightmap lm = QR_INVALID_HANDLE;
+  qr_world world = QR_INVALID_HANDLE;
+  qr_texture_desc tex_desc{
+      .mips = {{.pixels = texture.data(), .width = WIDTH, .height = HEIGHT,
+                .stride = WIDTH}},
+      .mip_count = 1,
+      .flags = 0,
+  };
+  qr_lightmap_desc lm_desc{
+      .pixels = light.data(),
+      .width = WIDTH,
+      .height = HEIGHT,
+      .stride = WIDTH,
+  };
+  qr_world_surface_desc surface{};
+  const std::array<qr_world_vertex, 4> quad{{
+      {.x = 0.0F, .y = 0.0F, .z = 0.25F, .u = 0.0F, .v = 0.0F,
+       .light_u = 0.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 0.0F, .z = 0.25F, .u = 4.0F, .v = 0.0F,
+       .light_u = 4.0F, .light_v = 0.0F},
+      {.x = 4.0F, .y = 4.0F, .z = 0.25F, .u = 4.0F, .v = 4.0F,
+       .light_u = 4.0F, .light_v = 4.0F},
+      {.x = 0.0F, .y = 4.0F, .z = 0.25F, .u = 0.0F, .v = 4.0F,
+       .light_u = 0.0F, .light_v = 4.0F},
+  }};
+  qr_world_polygon_desc polygon{
+      .surface = 0,
+      .vertices = quad.data(),
+      .vertex_count = static_cast<std::uint32_t>(quad.size()),
+  };
+  qr_world_draw_desc draw_desc{
+      .world = QR_INVALID_HANDLE,
+      .polygons = &polygon,
+      .polygon_count = 1,
+      .debug_mode = QR_DEBUG_TEXTURE_ONLY,
+  };
+  qr_frame *frame = nullptr;
+  qr_frame_desc frame_desc{};
+
+  REQUIRE(qr_upload_texture(ctx, &tex_desc, &tex) == QR_SUCCESS);
+  REQUIRE(qr_upload_lightmap(ctx, &lm_desc, &lm) == QR_SUCCESS);
+  surface.texture = tex;
+  surface.lightmap = lm;
+  REQUIRE(qr_create_world(ctx, &surface, 1, &world) == QR_SUCCESS);
+  draw_desc.world = world;
+
+  REQUIRE(qr_begin_frame(ctx, &frame_desc, &frame) == QR_SUCCESS);
+  CHECK(qr_frame_draw_world(frame, &draw_desc) == QR_ERROR_NO_SPACE);
+  REQUIRE(qr_end_frame(frame) == QR_SUCCESS);
 
   qr_destroy(ctx);
 }
