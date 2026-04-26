@@ -71,13 +71,13 @@ Exit criteria:
 
 ## Milestone 4: QrustyQuake Adapter Layer
 
-- [ ] Add adapter code outside the renderer core.
-- [ ] Extract Quake textures and mip levels into renderer atlas inputs.
-- [ ] Extract world surface metadata into renderer structs.
-- [ ] Extract static lightmaps into renderer atlas inputs.
-- [ ] Map Quake surface IDs to renderer surface handles.
-- [ ] Emit visible world surface command buffer from BSP/PVS traversal.
-- [ ] Keep existing KFD/palette backend as fallback during bring-up.
+- [x] Add adapter code outside the renderer core.
+- [x] Extract Quake textures and mip levels into renderer atlas inputs.
+- [x] Extract world surface metadata into renderer structs.
+- [x] Extract static lightmaps into renderer atlas inputs.
+- [x] Map Quake surface IDs to renderer surface handles.
+- [x] Record visible world surface command list from BSP/PVS traversal.
+- [x] Keep existing KFD/palette backend as fallback during bring-up.
 
 Exit criteria:
 
