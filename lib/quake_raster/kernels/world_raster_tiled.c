@@ -369,7 +369,11 @@ static void qr_consider_triangle(struct QrWorldRasterArgs *args,
   if ((surface->flags & QR_SURFACE_CUTOUT) != 0U && texel == 255U) {
     return;
   }
-  light = qr_sample_lightmap(lightmap, args->lightmap_atlas, light_u, light_v);
+  if (texel >= 224U) {
+    light = 255U;
+  } else {
+    light = qr_sample_lightmap(lightmap, args->lightmap_atlas, light_u, light_v);
+  }
 
   if (args->debug_mode == 1U) {
     color = (unsigned char)((triangle->surface + 1U) & 0xffU);
