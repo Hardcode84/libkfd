@@ -368,7 +368,7 @@ extern "C" int kfd_gpu_module_load(kfd_gpu_context *ctx, const void *image,
 
   auto bytes =
       std::span(reinterpret_cast<const std::byte *>(image), image_size);
-  auto exe = kfd::Executable::load(*ctx->dev, bytes, ctx->sdma, ctx->compute);
+  auto exe = kfd::Executable::load(*ctx->dev, bytes, ctx->compute);
   if (!exe)
     return set_error(exe.error());
 
@@ -484,13 +484,6 @@ extern "C" int kfd_gpu_fill32(kfd_gpu_context *ctx, void *dst_gpu,
   if (!ctx)
     return set_error(EINVAL, "invalid fill32 argument");
   auto r = ctx->sdma.const_fill(dst_gpu, value, bytes);
-  return r ? clear_error() : set_error(r.error());
-}
-
-extern "C" int kfd_gpu_acquire_mem(kfd_gpu_context *ctx) {
-  if (!ctx)
-    return set_error(EINVAL, "invalid acquire_mem argument");
-  auto r = ctx->compute.acquire_mem();
   return r ? clear_error() : set_error(r.error());
 }
 

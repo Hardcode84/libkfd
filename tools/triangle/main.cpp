@@ -199,13 +199,13 @@ int main(int argc, char **argv) {
     check(kfd_gpu_fence_create(ctx, 1, &frame.fence));
   }
 
-  auto win = KFD_EXPECT(
-      DRI3Window::create(width, height, NUM_BUFFERS, "libkfd triangle"));
+  auto win =
+      KFD_EXPECT(Window::create(width, height, NUM_BUFFERS, "libkfd triangle"));
   for (uint32_t i = 0; i < NUM_BUFFERS; ++i) {
-    KFD_EXPECT(win.import_buffer(i,
-                                 kfd_gpu_surface_dmabuf_fd(frames[i].surface),
-                                 kfd_gpu_surface_size(frames[i].surface),
-                                 kfd_gpu_surface_stride(frames[i].surface)));
+    KFD_EXPECT(win->import_buffer(i,
+                                  kfd_gpu_surface_dmabuf_fd(frames[i].surface),
+                                  kfd_gpu_surface_size(frames[i].surface),
+                                  kfd_gpu_surface_stride(frames[i].surface)));
   }
 
   uint32_t current = 0;
@@ -215,8 +215,8 @@ int main(int argc, char **argv) {
   std::printf("Entering triangle loop at %ux%u. Press 'q' to quit.\n", width,
               height);
 
-  while (win.poll()) {
-    win.wait_idle(current);
+  while (win->poll()) {
+    win->wait_idle(current);
 
     auto now = std::chrono::high_resolution_clock::now();
     float time = std::chrono::duration<float>(now - start).count();
@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     check(kfd_gpu_dispatch(ctx, demo.kernel, &cfg, frame.kernarg, frame.fence));
     check(kfd_gpu_fence_wait(frame.fence, 0, UINT64_MAX));
 
-    win.present(current);
+    win->present(current);
     current = (current + 1) % NUM_BUFFERS;
     ++frame_no;
   }

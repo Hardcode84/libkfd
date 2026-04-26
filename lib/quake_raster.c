@@ -310,17 +310,6 @@ static qr_result qr_result_from_gpu_error(int code)
   return qr_result_from_code(code, QR_ERROR_GPU);
 }
 
-static qr_result qr_acquire_gpu_inputs(qr_context *ctx)
-{
-  int err;
-
-  if (ctx == NULL || ctx->gpu == NULL) {
-    return QR_ERROR_INVALID_ARGUMENT;
-  }
-  err = kfd_gpu_acquire_mem(ctx->gpu);
-  return qr_result_from_gpu_error(err);
-}
-
 static void *qr_alloc_bytes(size_t size)
 {
   return malloc(size);
@@ -1140,10 +1129,6 @@ static int qr_dispatch_resolve_xrgb(qr_context *ctx,
     return EIO;
   }
   memcpy(palette_dst, palette_xrgb, 256U * sizeof(uint32_t));
-  err = kfd_gpu_acquire_mem(ctx->gpu);
-  if (err != 0) {
-    return err;
-  }
   start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(ctx->gpu, ctx->resolve_kernel,
                          &ctx->resolve_dispatch, ctx->resolve_kernarg,
@@ -1513,12 +1498,6 @@ qr_result qr_frame_clear_indexed(qr_frame *frame, uint8_t color)
   }
   args->color = (uint32_t)color;
   frame->ctx->frame_depth_valid = 0;
-  {
-    qr_result acquire_result = qr_acquire_gpu_inputs(frame->ctx);
-    if (acquire_result != QR_SUCCESS) {
-      return acquire_result;
-    }
-  }
   start_ns = qr_now_ns();
   err = kfd_gpu_dispatch(frame->ctx->gpu, frame->ctx->clear_kernel,
                          &frame->ctx->clear_dispatch,
@@ -1745,12 +1724,6 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   bin_args->triangle_count = (uint32_t)triangle_count;
 
   start_ns = qr_now_ns();
-  {
-    qr_result acquire_result = qr_acquire_gpu_inputs(ctx);
-    if (acquire_result != QR_SUCCESS) {
-      return acquire_result;
-    }
-  }
   if (preserve_depth != 0U) {
     err = kfd_gpu_dispatch(ctx->gpu, ctx->tile_bin_kernel,
                            &ctx->tile_bin_dispatch, ctx->tile_bin_kernarg,
@@ -1795,12 +1768,6 @@ static qr_result qr_dispatch_prepared_triangles(qr_context *ctx,
   }
 
   start_ns = qr_now_ns();
-  {
-    qr_result acquire_result = qr_acquire_gpu_inputs(ctx);
-    if (acquire_result != QR_SUCCESS) {
-      return acquire_result;
-    }
-  }
   err = kfd_gpu_dispatch(ctx->gpu, ctx->raster_kernel, &ctx->raster_dispatch,
                          ctx->raster_kernarg, ctx->raster_fence);
   if (err == 0) {
