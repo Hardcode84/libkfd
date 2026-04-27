@@ -140,8 +140,6 @@ static __gpu_local volatile unsigned lds_frame_closed;
 static __gpu_local volatile unsigned lds_current_epoch;
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_terminate;
-[[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_subtile_table[NUM_SUBTILES];
 
 static float edge(float ax, float ay, float bx, float by, float px, float py) {
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
@@ -394,17 +392,12 @@ static void process_tile_subtiled(const struct DemoPrimitive *prims,
   const unsigned lane = tid & 31u;
   const unsigned wave = tid >> 5u;
 
-  if (tid < NUM_SUBTILES)
-    lds_subtile_table[tid] = tid;
-  __gpu_sync_threads();
-
   if (wave < PERSISTENT_WAVE_COUNT) {
     for (unsigned pass = 0; pass < SUBTILE_PASSES_PER_WAVE; ++pass) {
-      unsigned index = pass * PERSISTENT_WAVE_COUNT + wave;
-      if (index >= NUM_SUBTILES)
+      unsigned subtile = pass * PERSISTENT_WAVE_COUNT + wave;
+      if (subtile >= NUM_SUBTILES)
         continue;
 
-      unsigned subtile = lds_subtile_table[index];
       if (clear_only) {
         clear_subtile(color, depth, width, height, pitch, tile_size,
                       clear_color, clear_depth, tile_x, tile_y, subtile, lane);
