@@ -52,6 +52,26 @@ struct PersistentFrame {
   unsigned clear_only;
 };
 
+struct ClaimFrameArgs {
+  const struct DemoPrimitive *prims;
+  const unsigned *tile_indices;
+  const struct TileRange *tile_ranges;
+  volatile unsigned *tile_claims;
+  unsigned *color;
+  float *depth;
+  unsigned width;
+  unsigned height;
+  unsigned pitch;
+  unsigned tile_size;
+  unsigned tiles_x;
+  unsigned tiles_y;
+  unsigned clear_color;
+  float clear_depth;
+  unsigned clear_only;
+  unsigned tile_count;
+  unsigned frame_epoch;
+};
+
 struct PersistentControl {
   volatile unsigned terminate;
   volatile unsigned ready;
@@ -235,6 +255,47 @@ __gpu_kernel void rasterdemo_frame(struct RasterArgs args) {
   raster_tile(args.prims, args.tile_indices, range, args.color, args.depth,
               args.width, args.height, args.pitch, args.tile_size,
               args.clear_color, args.clear_depth, tile_x, tile_y);
+}
+
+__gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
+  unsigned tid = __gpu_thread_id_x() +
+                 __gpu_thread_id_y() * __gpu_num_threads_x() +
+                 __gpu_thread_id_z() * __gpu_num_threads_x() *
+                     __gpu_num_threads_y();
+
+  for (;;) {
+    if (tid == 0)
+      lds_claimed_tile =
+          pick_tile(args.tile_claims, args.tile_count, args.frame_epoch);
+    __gpu_sync_threads();
+    unsigned tile = lds_claimed_tile;
+    if (tile >= args.tile_count)
+      break;
+
+    if (tid == 0) {
+      struct TileRange range = args.tile_ranges[tile];
+      lds_tile_range_offset = range.offset;
+      lds_tile_range_count = range.count;
+    }
+    __gpu_sync_threads();
+
+    unsigned tile_x = tile % args.tiles_x;
+    unsigned tile_y = tile / args.tiles_x;
+    if (args.clear_only) {
+      clear_tile(args.color, args.depth, args.width, args.height, args.pitch,
+                 args.tile_size, args.clear_color, args.clear_depth, tile_x,
+                 tile_y);
+    } else {
+      struct TileRange range = {
+          .offset = lds_tile_range_offset,
+          .count = lds_tile_range_count,
+      };
+      raster_tile(args.prims, args.tile_indices, range, args.color, args.depth,
+                  args.width, args.height, args.pitch, args.tile_size,
+                  args.clear_color, args.clear_depth, tile_x, tile_y);
+    }
+    __gpu_sync_threads();
+  }
 }
 
 __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {

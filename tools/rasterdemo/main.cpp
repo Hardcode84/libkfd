@@ -11,6 +11,7 @@
 #include "libkfd/detail/elf.h"
 #include "libkfd/libkfd.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -93,6 +94,26 @@ struct PersistentControl {
   uint32_t tile_count;
 };
 
+struct ClaimFrameArgs {
+  const DemoPrimitive *prims;
+  const uint32_t *tile_indices;
+  const TileRange *tile_ranges;
+  uint32_t *tile_claims;
+  uint32_t *color;
+  float *depth;
+  uint32_t width;
+  uint32_t height;
+  uint32_t pitch;
+  uint32_t tile_size;
+  uint32_t tiles_x;
+  uint32_t tiles_y;
+  uint32_t clear_color;
+  float clear_depth;
+  uint32_t clear_only;
+  uint32_t tile_count;
+  uint32_t frame_epoch;
+};
+
 struct PersistentArgs {
   PersistentControl *control;
   const DemoPrimitive *prims;
@@ -136,10 +157,14 @@ static const DemoBinary rasterdemo_kernels[] = {
 struct Framebuffer {
   kfd::Buffer color;
   kfd::Buffer tile_claims;
+  kfd::Buffer frame_claims;
   kfd::DMABuffer dmabuf;
   kfd::Buffer kernarg;
+  kfd::Buffer claim_kernarg;
   std::unique_ptr<kfd::Signal> signal;
 };
+
+enum class KernelMode { Persistent, PerFrame, StaticGrid };
 
 #ifdef HAVE_RASTERDEMO_XCB_SW
 xcb_atom_t intern_atom(xcb_connection_t *conn, const char *name) {
@@ -555,7 +580,7 @@ int main(int argc, char **argv) {
   bool probe_only = false;
   bool clear_only = false;
   bool headless = false;
-  bool single_shot = false;
+  KernelMode kernel_mode = KernelMode::Persistent;
   uint32_t max_frames = 0;
   uint32_t gpu_timeout_ms = 5000;
   uint32_t requested_persistent_wgs = 0;
@@ -600,8 +625,12 @@ int main(int argc, char **argv) {
       headless = true;
       continue;
     }
-    if (arg == "--single-shot") {
-      single_shot = true;
+    if (arg == "--per-frame" || arg == "--single-shot") {
+      kernel_mode = KernelMode::PerFrame;
+      continue;
+    }
+    if (arg == "--static-grid") {
+      kernel_mode = KernelMode::StaticGrid;
       continue;
     }
     if (arg == "--drm") {
@@ -628,7 +657,10 @@ int main(int argc, char **argv) {
                   "triangle rasterization\n"
                   "  --headless              render frames without opening a "
                   "display\n"
-                  "  --single-shot           use one kernel dispatch per "
+                  "  --per-frame             one dynamic tile-claim dispatch "
+                  "per frame\n"
+                  "  --single-shot           alias for --per-frame\n"
+                  "  --static-grid           one static grid dispatch per "
                   "frame for debugging\n"
                   "  xcb: X11 desktop mode; falls back to xcb_put_image when "
                   "DRI3 is unavailable\n"
@@ -657,6 +689,7 @@ int main(int argc, char **argv) {
   auto exe = KFD_EXPECT(kfd::Executable::load(dev, kernel_file, compute));
   auto frame_kernel = KFD_EXPECT(
       exe.kernel(clear_only ? "rasterdemo_clear_frame.kd" : "rasterdemo_frame.kd"));
+  auto claim_frame_kernel = KFD_EXPECT(exe.kernel("rasterdemo_claim_frame.kd"));
   auto persistent_kernel = KFD_EXPECT(exe.kernel("rasterdemo_persistent.kd"));
 
   if (probe_only) {
@@ -826,9 +859,14 @@ int main(int argc, char **argv) {
         dev, kfd::detail::align_up(tile_claims_bytes, kfd::detail::page_size()),
         kfd::MemType::VRAM, kfd::MemFlags::WRITABLE));
     KFD_EXPECT(fbs[i].tile_claims.map(dev));
+    fbs[i].frame_claims = KFD_EXPECT(kfd::Buffer::allocate(
+        dev, kfd::detail::align_up(tile_claims_bytes, kfd::detail::page_size()),
+        kfd::MemType::GTT, HOST_GTT_FLAGS));
+    KFD_EXPECT(fbs[i].frame_claims.map(dev));
     if (!software_present && !headless)
       fbs[i].dmabuf = KFD_EXPECT(kfd::DMABuffer::create(fbs[i].color));
     fbs[i].kernarg = KFD_EXPECT(frame_kernel.alloc());
+    fbs[i].claim_kernarg = KFD_EXPECT(claim_frame_kernel.alloc());
     fbs[i].signal =
         std::make_unique<kfd::Signal>(KFD_EXPECT(kfd::Signal::create(ctx)));
     if (!software_present && !headless)
@@ -885,13 +923,17 @@ int main(int argc, char **argv) {
   persistent_kernel.fill(persistent_kernarg, persistent_launch, persistent_cfg);
   auto shutdown_signal = KFD_EXPECT(kfd::Signal::create(ctx));
 
-  if (!single_shot) {
+  if (kernel_mode == KernelMode::Persistent) {
     KFD_EXPECT(compute.dispatch(persistent_kernel, persistent_cfg,
                                 persistent_kernarg));
     std::printf("Kernel mode: persistent (%u workgroups, %ux%u threads)\n",
                 persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
+  } else if (kernel_mode == KernelMode::PerFrame) {
+    std::printf("Kernel mode: per-frame tile claim (%u workgroups, %ux%u "
+                "threads)\n",
+                persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
   } else {
-    std::printf("Kernel mode: single-shot dispatch per frame\n");
+    std::printf("Kernel mode: static grid dispatch per frame\n");
   }
 
   uint32_t current = 0;
@@ -952,7 +994,7 @@ int main(int argc, char **argv) {
         .clear_depth = CLEAR_DEPTH,
     };
 
-    if (single_shot) {
+    if (kernel_mode == KernelMode::StaticGrid) {
       frame_kernel.fill(fbs[current].kernarg, args, cfg);
 
       KFD_EXPECT(fbs[current].signal->reset());
@@ -963,6 +1005,48 @@ int main(int argc, char **argv) {
       if (!waited) {
         std::fprintf(stderr,
                      "error: frame %u GPU wait timed out or failed: %s\n",
+                     frame, kfd::strerror(waited));
+        return 1;
+      }
+    } else if (kernel_mode == KernelMode::PerFrame) {
+      uint32_t frame_epoch = (frame + 1) & 0x7fffffffu;
+      auto *frame_claims =
+          static_cast<uint32_t *>(fbs[current].frame_claims.data());
+      std::fill_n(frame_claims, static_cast<size_t>(tile_count), frame_epoch);
+      kfd::detail::memory_barrier();
+
+      ClaimFrameArgs claim_args{
+          .prims = args.prims,
+          .tile_indices = args.tile_indices,
+          .tile_ranges = args.tile_ranges,
+          .tile_claims = frame_claims,
+          .color = args.color,
+          .depth = args.depth,
+          .width = args.width,
+          .height = args.height,
+          .pitch = args.pitch,
+          .tile_size = args.tile_size,
+          .tiles_x = tiles_x,
+          .tiles_y = tiles_y,
+          .clear_color = args.clear_color,
+          .clear_depth = args.clear_depth,
+          .clear_only = clear_only ? 1u : 0u,
+          .tile_count = tile_count,
+          .frame_epoch = frame_epoch,
+      };
+      claim_frame_kernel.fill(fbs[current].claim_kernarg, claim_args,
+                              persistent_cfg);
+
+      KFD_EXPECT(fbs[current].signal->reset());
+      KFD_EXPECT(compute.dispatch(claim_frame_kernel, persistent_cfg,
+                                  fbs[current].claim_kernarg,
+                                  *fbs[current].signal));
+      auto waited =
+          fbs[current].signal->wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
+      if (!waited) {
+        std::fprintf(stderr,
+                     "error: frame %u per-frame GPU wait timed out or failed: "
+                     "%s\n",
                      frame, kfd::strerror(waited));
         return 1;
       }
@@ -1031,7 +1115,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!single_shot) {
+  if (kernel_mode == KernelMode::Persistent) {
     __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
     KFD_EXPECT(compute.signal(shutdown_signal));
     auto stopped =
