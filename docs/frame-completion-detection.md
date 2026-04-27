@@ -3,12 +3,16 @@
 How does the host know that all primitives of frame F have actually
 been rasterized into the framebuffer, so it can flip / present?
 
-This is an underdefined area in `bin-ownership-pipeline-proposal.md`.
-That proposal assumes a persistent megakernel that lives across many
-frames; the kernel does not exit at frame boundaries, so there is no
+`bin-ownership-pipeline-proposal.md` §6.9 names this as a separate
+concern and defers the protocol to this document. That proposal
+assumes a persistent megakernel that lives across many frames; the
+kernel does not exit at frame boundaries, so there is no
 `cudaDeviceSynchronize`- or fence-on-dispatch-complete equivalent.
 Frame completion has to be detected *inside* the live pipeline and
-*signalled out* to the host.
+*signalled out* to the host. This document specifies the protocol
+that bin-ownership §6.9 wires into the renderer's phase-4
+`ack_drain` (see §2.5 of bin-ownership) and the host's seal-after-
+push step (§2.7).
 
 This document:
 
@@ -17,6 +21,14 @@ This document:
 3. Enumerates variants (§3) with trade-offs.
 4. Picks a recommendation (§4) and shows how it integrates with the
    bin-ownership pipeline (§5).
+
+**Performance numbers in this document are order-of-magnitude
+estimates** based on AMDGPU and PCIe atomic round-trip latencies,
+not measurements. The wakeup-latency comparison in §5.8, the
+~100 ms / ~hundreds-of-μs / ~800 μs figures in the V1/V2/V4
+analyses (§3), and the ~100 μs/frame host-visible cost in §5.7
+are sanity checks for ordering the variants, not contractual
+performance claims.
 
 ## 1. What cuRE Does
 
@@ -184,11 +196,11 @@ FrameAck frame_ack[NUM_INFLIGHT_FRAMES];   // fine-grained SVM
 
 // Renderer, after rasterizing K_F primitives of frame F from a single
 // drained batch:
-atomic_fetch_add(&frame_ack[F % N_F_INFLIGHT].rendered, K_F);
+atomic_fetch_add(&frame_ack[F % NUM_INFLIGHT_FRAMES].rendered, K_F);
 
 // Host, after pushing all N_F primitives of F:
-atomic_store(&frame_ack[F % N_F_INFLIGHT].expected, N_F);
-while (atomic_load(&frame_ack[F % N_F_INFLIGHT].rendered) < N_F)
+atomic_store(&frame_ack[F % NUM_INFLIGHT_FRAMES].expected, N_F);
+while (atomic_load(&frame_ack[F % NUM_INFLIGHT_FRAMES].rendered) < N_F)
   cpu_relax_or_yield();
 flip();
 ```
@@ -265,23 +277,25 @@ for (uint32_t t = 0; t < B; ++t) {
 while (drain_one(&entry)) {
   if (entry.kind == EOF_F) {
     // This tile is fully rasterized for F.
-    atomic_fetch_add(&tile_eof_acks[F % N_F_INFLIGHT], 1);
+    atomic_fetch_add(&tile_eof_acks[F % NUM_INFLIGHT_FRAMES], 1);
     continue;
   }
   rasterize(entry);
 }
 
 // Host:
-while (atomic_load(&tile_eof_acks[F % N_F_INFLIGHT]) < B)
+while (atomic_load(&tile_eof_acks[F % NUM_INFLIGHT_FRAMES]) < B)
   cpu_relax();
 ```
 
 Cost:
 
-- B tile-queue pushes per frame just for EOF (≈ 8160 at 1080p / 32×32).
-  Each push is a `TILE_QLOCK` acquire/release plus 8–16 B of queue
-  data. At ~100 ns per push that's ~800 μs of distribute-mode work
-  per frame — too much.
+- B tile-queue pushes per frame just for EOF (≈ 2040 at 1080p /
+  32×32; ≈ 8160 at 1080p / 16×16). Each push is a `TILE_QLOCK`
+  acquire/release plus 8–16 B of queue data. At an estimated
+  ~100 ns per push that's ~200 μs at 32×32 or ~800 μs at 16×16 of
+  distribute-mode work per frame — too much at the smaller tile
+  size, marginal at the larger.
 - B atomic increments at frame end (one per tile renderer that sees
   EOF). Same cost as ~1 atomic per drain in V2 but with more
   contention (all renderers ack at once at frame end).
@@ -323,10 +337,11 @@ The "never touched by F" branch is the hard part: the host does not
 know which tiles F touched without GPU help. Two options:
 
 - **GPU-side touch tracking**: distributor sets a bit in
-  `frame_touched[F % N_F_INFLIGHT][B/32]` when pushing a prim of F to
-  tile t. Host iterates set bits; for each set bit, polls
-  `tile_last_drained_frame[t] >= F`. Storage: `N_F_INFLIGHT ×
-  B / 8` bytes — ~4 KB at 1080p / 32×32 / 4 frames.
+  `frame_touched[F % NUM_INFLIGHT_FRAMES][B/32]` when pushing a prim
+  of F to tile t. Host iterates set bits; for each set bit, polls
+  `tile_last_drained_frame[t] >= F`. Storage: bitmap
+  `NUM_INFLIGHT_FRAMES × B / 8 B` plus watermark `B × 4 B` —
+  ≈ 9 KiB at 1080p / 32×32 / 4 frames.
 - **Conservative all-tiles**: host treats all B tiles as touched.
   This converts to: `min(tile_last_drained_frame[]) >= F`. Wrong for
   scenes where some tiles never receive a prim — they will never tick
@@ -354,15 +369,15 @@ Already described as part of V4 and V5. As a standalone proposal:
 
 ```c
 // SVM
-_Atomic uint64_t frame_touched[N_F_INFLIGHT][B / 64];  // bitmap of touched tiles
-_Atomic uint64_t frame_drained[N_F_INFLIGHT][B / 64];  // bitmap of drained tiles
+_Atomic uint64_t frame_touched[NUM_INFLIGHT_FRAMES][B / 64];  // bitmap of touched tiles
+_Atomic uint64_t frame_drained[NUM_INFLIGHT_FRAMES][B / 64];  // bitmap of drained tiles
 
 // Distributor, pushing prim of F to tile t:
-atomic_fetch_or(&frame_touched[F % N_F_INFLIGHT][t / 64], 1ULL << (t % 64));
+atomic_fetch_or(&frame_touched[F % NUM_INFLIGHT_FRAMES][t / 64], 1ULL << (t % 64));
 
 // Renderer, draining a tile t whose queue's last entry's frame was F_max:
 // (after rasterize, when this tile's queue is empty for frames < F_max)
-atomic_fetch_or(&frame_drained[F_max % N_F_INFLIGHT][t / 64], 1ULL << (t % 64));
+atomic_fetch_or(&frame_drained[F_max % NUM_INFLIGHT_FRAMES][t / 64], 1ULL << (t % 64));
 
 // Host: frame F complete when frame_touched[F] == frame_drained[F] for all dwords.
 ```
@@ -373,8 +388,8 @@ had frame ≥ F". This is handled by combining with V5's
 `tile_last_drained_frame` and only setting the drained bit when the
 tile's watermark crosses F.
 
-Storage: 2 × N_F_INFLIGHT × B / 8 bytes = ~2 KB at 1080p / 32×32 / 4
-frames. Negligible.
+Storage: 2 × NUM_INFLIGHT_FRAMES × B / 8 bytes = ~2 KiB at 1080p /
+32×32 / 4 frames. Negligible.
 
 Pro: precise, per-tile diagnostics, no per-prim atomics on a hot
 location.
@@ -481,9 +496,10 @@ struct TileEntry { uint32_t prim_id; uint8_t frame_id; uint8_t _pad[3]; };
 
 `frame_id` is the low 8 bits of F. NUM_INFLIGHT_FRAMES ≤ 4 makes 8
 bits redundantly safe for hundreds of frames between wraps. The
-extra 4 B per entry adds to tile queue memory (§6.1 of bin-ownership
-proposal) — multiplies the per-entry size from 4 to 8 B. At C = 256
-this is 1 KB → 2 KB per tile, 16 MB → 32 MB total at 1080p / 32×32.
+extra 4 B per entry adds to tile queue memory (§5.1 / §5.2 of
+bin-ownership proposal) — multiplies the per-entry size from 4 to
+8 B. At C = 256 this is ~1 KiB → ~2 KiB per tile; the §5.6 total
+at 1080p / 32×32 grows from ~2 MiB to ~4 MiB of tile state.
 Acceptable but worth noting in the memory budget.
 
 Alternative: pack `frame_id` into the high bits of `prim_id` (24-bit
@@ -637,7 +653,7 @@ __device__ void flush_acc(void) {
 }
 ```
 
-WG_ACC_FLUSH_THRESHOLD ≈ 256 keeps host-visible advance fine-grained
+`ACC_FLUSH_THRESHOLD ≈ 256` keeps host-visible advance fine-grained
 enough that the host wait loop sees timely progress (worst case the
 host waits for one full batch's worth of accumulator ≈ tens of μs).
 
@@ -649,7 +665,7 @@ sees another prim of F, will hold its accumulator forever. Two
 defenses:
 
 - **End-of-iteration flush on observed seal**: on each main-loop
-  iteration the WG checks whether `expected[F % N_F_INFLIGHT]` was
+  iteration the WG checks whether `expected[F % NUM_INFLIGHT_FRAMES]` was
   set; if yes and `wg_acc.frame_id == F`, flush. This guarantees the
   host wait loop terminates.
 - **Heartbeat-piggybacked flush**: if a WG has had no productive
@@ -689,7 +705,7 @@ but wastes CPU when frames are long (≥ 1 ms) or when the host has
 other work it could do. AMDGPU's KFD interface supports interrupt-
 driven wakeup; libkfd already wraps it.
 
-#### Primitives
+#### 5.8.1 Primitives
 
 `include/libkfd/event.h` exposes `kfd::Event`:
 
@@ -708,7 +724,7 @@ wait" — exactly the polling-then-block pattern we want for the host.
 `ComputeQueue::wait_reg_mem` (`:228`) submit the PM4 packets that
 make this work end-to-end.
 
-#### The persistent-megakernel wrinkle
+#### 5.8.2 The persistent-megakernel wrinkle
 
 The standard `ComputeQueue::dispatch(kernel, cfg, kernarg, signal)`
 overload queues a `RELEASE_MEM` packet *after* the dispatch on the
@@ -732,7 +748,7 @@ Q2's CP stalls on the WAIT_REG_MEM until the megakernel's bulk-ack
 atomics push `rendered` past `N_F`, then the RELEASE_MEM fires the
 KFD interrupt, which wakes the host's `Signal::wait()`.
 
-#### Per-frame protocol
+#### 5.8.3 Per-frame protocol
 
 ```c
 // At app init, once.
@@ -780,7 +796,7 @@ void host_render_frame_blocking(uint32_t F,
 }
 ```
 
-#### What changes vs §5.3
+#### 5.8.4 What changes vs §5.3
 
 | Concern | §5.3 polling | §5.8 interrupt |
 |---|---|---|
@@ -792,7 +808,7 @@ void host_render_frame_blocking(uint32_t F,
 | Extra GPU resources | 0 | 1 helper compute queue |
 | Fits if host has other work | poorly | well |
 
-#### What stays unchanged
+#### 5.8.5 What stays unchanged
 
 - Tile queue entry format (§5.2) — still carries `frame_id`.
 - Distributor side (§5.4) — passes `frame_id` through to tile entries.
@@ -805,7 +821,7 @@ void host_render_frame_blocking(uint32_t F,
   in its accumulator can stall the helper queue's WAIT_REG_MEM
   forever (host's wait would then time out at 100 ms above).
 
-#### Caveats
+#### 5.8.6 Caveats
 
 1. **KFD events are finite per process** — typical limit ~4096.
    Reusing one `Signal` per swapchain slot via `reset()` keeps usage
@@ -816,7 +832,8 @@ void host_render_frame_blocking(uint32_t F,
 3. **Helper queue scheduling.** Q2 does no compute; its CP needs to
    be admitted to a CU's scheduler but uses ~no compute resources
    beyond ring buffer storage. SDMA queues could in principle run
-   the same packets — review `lib/queue.cpp` and `packets/sdma.h`
+   the same packets — review `libkfd/lib/queue.cpp` and
+   `libkfd/include/libkfd/packets/sdma.h`
    for support on the target gen if compute-queue contention proves
    problematic.
 4. **The `expected` field is no longer the host wait predicate**, but
@@ -834,7 +851,7 @@ void host_render_frame_blocking(uint32_t F,
    KFD event from compute kernel" mechanism; that is what RELEASE_MEM
    is for.
 
-#### When to use which
+#### 5.8.7 When to use which
 
 - **Polling (§5.3)** for early bring-up, simplicity, and at high fps
   where the host has no other work.

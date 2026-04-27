@@ -406,8 +406,9 @@ What needs adaptation:
   per-frame completion without relying on kernel exit.
 - **Host↔GPU shared queues.** cuRE has no host-streamed queue (it
   uploads the whole frame upfront). The bin-ownership proposal adds
-  one via fine-grained SVM; see
-  `bin-ownership-pipeline-proposal.md` §2.2.
+  one via fine-grained SVM with a binary host-shared lock; see
+  `bin-ownership-pipeline-proposal.md` §2.2.1 (lock semantics) and
+  §2.7 (host push protocol).
 
 Relevant AMDGPU/libkfd background:
 
@@ -439,7 +440,7 @@ Everything else -- megakernel, persistent threads, two-level binning, stamp
 shading, vertex reuse -- is pipeline structure built on top of those two
 primitives.
 
-## 8. Recommended Reading
+## 8. Reading
 
 In priority order if any of this is to be ported:
 

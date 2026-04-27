@@ -57,8 +57,13 @@ These docs cover the **rasterization pipeline** end-to-end:
   (no skinning, animation rigs, LOD).
 - Sampled texture maps (the checker is procedural). A real texture
   cache + sampler is a downstream extension.
-- Present path (assume the dma-buf swapchain pattern already
-  exercised by `tools/computetoy`).
+- **Designing** a new present path. The demo *reuses* the dma-buf
+  swapchain pattern already exercised by `tools/computetoy` once
+  windowed mode lands at the end of stage 1
+  (`bin-ownership-pipeline-proposal.md` §9). Stages 0 and the
+  headless test runs of stage 1+ never touch a swapchain — they
+  read the framebuffer back to host memory instead
+  (`headless-testing.md` §2).
 - Demo content beyond "rotating teapot or similar" (asset format,
   mesh loading, animation are downstream concerns).
 
@@ -73,8 +78,22 @@ These docs cover the **rasterization pipeline** end-to-end:
   16×16), the unit of wave-level rasterization within a WG.
 - **B** — number of coarse bins covering the framebuffer.
 - **N** — number of resident WGs (≈ hardware occupancy).
-- **B/N** — design-determining ratio. The bin-ownership design is
-  robust at `B/N ≥ 16` and breaks down below `B/N < 4`.
+- **W** — number of waves per WG.
+- **C** — per-tile queue capacity (entries). Recommended default
+  256 (`bin-ownership-pipeline-proposal.md` §5.3).
+- **P_max** — primitive-store capacity (primitives buffered in
+  fine-grained SVM, frame-resident).
+- **N_F** — primitive count of frame F (used by the per-frame
+  ack protocol, `frame-completion-detection.md` §5).
+- **NUM_INFLIGHT_FRAMES** — host's frame-ring depth (typically 2–4),
+  unrelated to `N`.
+- **B/N** — design-determining ratio. Three regimes:
+  - `B/N ≥ 16` — robust; random tile claim is essentially uncontended.
+  - `4 ≤ B/N < 16` — works with picking heuristics (`bin-ownership-pipeline-proposal.md` §4).
+  - `B/N < 4` — breaks down; fixed-role partitioning (a few
+    distributor WGs, rest renderers) is the better trade.
+
+  The 1080p teapot demo lands at `B/N ≈ 25` with 32×32 bins.
 - **Megakernel** — a single long-running compute kernel that
   encapsulates all pipeline stages, contrasted with one
   kernel-per-stage.

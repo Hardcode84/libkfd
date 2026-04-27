@@ -36,6 +36,14 @@ Companion docs:
 - `frame-completion-detection.md` — how the host detects end-of-
   frame against the persistent megakernel.
 
+**Performance numbers in this document are order-of-magnitude
+estimates** derived from AMDGPU instruction latencies, typical
+PCIe/SVM atomic round-trips, and per-operation arithmetic — not
+measurements. Anything labelled "~", "≈", or "typical" is a
+back-of-envelope figure; treat it as a sanity check, not a
+specification. Concrete measurements will replace these as the
+demo is brought up.
+
 ## 1. Why This Shape
 
 The bin-ownership shape is robust against three failure modes that
@@ -112,6 +120,10 @@ Host                                GPU (one megakernel)
                                        framebuffer
                                        (per-tile exclusive write)
 ```
+
+(`host_q_lock` in the host box is the same symbol as
+`host_queue_lock` on the GPU side; abbreviated to fit the diagram
+width.)
 
 Key properties:
 
@@ -291,33 +303,37 @@ possible — only the actual pop. Bucketing and tile pushes happen
 by the WG's distribution work.
 
 ```c
-uint32_t attempts = 0;                    // §2.8 backoff counter
+uint32_t attempts = 0;                    // §2.8 backoff counter, per-WG SGPR
 for (;;) {
-  if (atomic_load(&terminate)) break;
+  bool terminating = atomic_load(&terminate);
 
-  // §3 covers alternative mode-selection policies.
+  // Try distribute mode: pop one batch under host_queue_lock, then
+  // distribute outside the lock. §3 covers alternative mode policies.
   StreamBatch batch;
   bool got_batch = false;
   if (try_claim(&host_queue_lock)) {
     got_batch = pop_host_queue(&batch);
     release(&host_queue_lock);            // release ASAP — host may be waiting
   }
-
   if (got_batch) {
-    distribute_batch(&batch);             // §2.4; no host_queue_lock held
+    distribute_batch(&batch, &attempts);  // §2.4; no host_queue_lock held
     attempts = 0;                         // productive: reset backoff
-  } else {
-    // Either CAS failed (host or another distributor holds the lock)
-    // or queue was empty. Fall through to render mode.
-    uint32_t tile = pick_tile();          // §4
-    if (tile == NO_TILE) { wg_backoff(&attempts); continue; }   // §2.8
-    if (render_try_acquire(tile)) {
-      render(tile);                       // §2.5; releases TILE_RENDER inside
-      attempts = 0;
-    }
-    // CAS-fail: tile is busy (queue access or another renderer);
-    // just loop and try a different tile next iteration.
+    continue;
   }
+
+  // Try render mode: pick a tile with pending primitives, claim it.
+  uint32_t tile = pick_tile();            // §4
+  if (tile != NO_TILE && render_try_acquire(tile)) {
+    render(tile);                         // §2.5; releases TILE_RENDER inside
+    attempts = 0;
+    continue;
+  }
+
+  // No work this iteration in either mode. The exit condition (§7.1)
+  // is exactly this: terminate is set AND no work was found, so this
+  // WG has nothing left to drain. Otherwise back off and retry.
+  if (terminating) break;
+  wg_backoff(&attempts);                  // §2.8
 }
 ```
 
@@ -343,7 +359,7 @@ primitives by target tile in LDS first (no global atomics), then
 pushes each bucket under that tile's queue-lock bit.
 
 ```c
-__device__ void distribute_batch(StreamBatch *batch) {
+__device__ void distribute_batch(StreamBatch *batch, uint32_t *attempts) {
   // Phase 1: bucket-by-tile in LDS (parallel across waves, no atomics
   //          on tile queues yet)
   __shared__ uint32_t lds_bucket_count[B_SUBSET];
@@ -365,7 +381,7 @@ __device__ void distribute_batch(StreamBatch *batch) {
         --pending;
       }
     }
-    if (pending > 0) wg_backoff(&attempts);  // §2.8; retry contended buckets
+    if (pending > 0) wg_backoff(attempts);   // §2.8; retry contended buckets
   }
 }
 ```
@@ -411,14 +427,17 @@ The second is preferable for moderate batches.
 
 ### 2.5 Render Mode
 
-A render pass on tile `t` proceeds in three lock phases mapping directly
-to the 3-state protocol in §2.2.2:
+A render pass on tile `t` proceeds in four phases — three lock
+transitions mapping directly to the 3-state protocol in §2.2.2,
+plus a per-frame ack flush:
 
 1. Acquire `TILE_QLOCK` on `t` (CAS from `0x0`).
 2. Drain the tile queue into LDS, then transition `TILE_QLOCK → TILE_RENDER`
    (CAS `0x1 → 0x2`).
-3. Rasterize from LDS while holding only `TILE_RENDER`. Release at the
-   end (`atomicAnd(~TILE_RENDER)`).
+3. Rasterize from LDS while holding only `TILE_RENDER`.
+4. Flush the per-WG frame-ack accumulator (§6.9; full protocol in
+   `frame-completion-detection.md` §5.5), then release
+   `TILE_RENDER` (`atomicAnd(~TILE_RENDER)`).
 
 ```c
 __device__ void render(uint32_t tile) {
@@ -427,7 +446,9 @@ __device__ void render(uint32_t tile) {
 
   __shared__ uint32_t lds_prim_count;
   __shared__ uint32_t lds_prim_indices[MAX_TILE_PRIMS];
-  drain_tile_queue(tile, lds_prim_indices, &lds_prim_count);
+  __shared__ uint16_t lds_prim_frame_id[MAX_TILE_PRIMS];   // see §6.9
+  drain_tile_queue(tile, lds_prim_indices,
+                   lds_prim_frame_id, &lds_prim_count);
 
   // Phase 2: switch to RENDERING-only. Distributors may now push to
   // this tile's queue concurrently with the rasterize below.
@@ -437,8 +458,16 @@ __device__ void render(uint32_t tile) {
   // queue and are rendered by the next claim of this tile.
   rasterize_tile(tile, lds_prim_indices, lds_prim_count);
 
-  // Release the rendering bit. atomicAnd preserves a concurrent
-  // distributor's TILE_QLOCK bit if any.
+  // Phase 4: ack the rasterized primitives to their frame counters,
+  // then release the rendering bit. ack_drain accumulates per-frame
+  // counts in SGPRs and folds them into the appropriate
+  // frame_ack[FRAME_SLOT(F)].rendered entries (see
+  // frame-completion-detection.md §5.5 for the body, §5.6 for the
+  // forced-flush corner case, and §6.9 here for integration).
+  ack_drain(lds_prim_frame_id, lds_prim_count);
+
+  // atomicAnd preserves a concurrent distributor's TILE_QLOCK bit
+  // if any.
   render_release(tile);
 }
 ```
@@ -633,7 +662,7 @@ relationship with the previous releaser's writes to either pointer.
 |---|---|---|
 | spin | 256 | ~1 μs/pause × 256 ≈ 256 μs, comfortably above typical GPU drain |
 | yield | 32 | covers OS scheduler hiccups (sibling thread runs) |
-| sleep | unbounded | progressive 1 μs → 100 μs; bounded by watchdog (§7) |
+| sleep | unbounded | progressive 1 μs → 100 μs; the application's own host-side hang watchdog (e.g. §7.3 GPU heartbeat going stale) is what eventually breaks the loop, not a fixed cap |
 
 The `cpu_relax` hint matters. On x86 it tells the CPU to relax SMT
 scheduling (frees pipeline slots for the SMT sibling) and inserts a
@@ -728,27 +757,41 @@ a successful tile push, or a successful render. Sustained "no work"
 escalates the sleep up to the ~2 μs cap.
 
 ```c
+// Simplified shape; the canonical loop is in §2.3.
 uint32_t attempts = 0;
 for (;;) {
-  if (atomic_load(&terminate)) break;
+  bool terminating = atomic_load(&terminate);
   if (try_pop_or_render()) { attempts = 0; continue; }
+  if (terminating) break;
   wg_backoff(&attempts);
 }
 ```
 
-The cap matters: capping at ~2 μs keeps the WG responsive to new host
-pushes (which arrive at ≤ host queue latency, ~μs), and keeps total
-backoff time well under the watchdog threshold (§7.4, typically 1–10 ms).
+The cap matters for **responsiveness**: a 2 μs sleep means a WG sees
+a new host push within ~2 μs of the host releasing
+`host_queue_lock`. It does *not* matter for watchdog avoidance —
+`s_sleep` keeps the wave resident and issuing the `s_sleep`
+instruction itself, so the KFD GPU watchdog (§7.4, 1–10 s) sees CP
+progress regardless of sleep depth. The host heartbeat watchdog
+(§7.3) is a separate concern: §2.8 backoff iterations do not bump
+the heartbeat (only productive iterations do), so a fully idle
+pipeline trips §7.3 unless the host suspends the watchdog when it
+stops pushing.
 
 #### Where to call wg_backoff
 
+The §2.3 main loop calls `wg_backoff(&attempts)` at exactly one
+site — the bottom-of-iteration "no work" path — and resets
+`attempts = 0` whenever a productive distribute or render
+completes. `distribute_batch` (§2.4) calls it inside its phase-2
+retry loop while there are still buckets pending against contended
+tile locks.
+
 | Site | Backoff? | Rationale |
 |---|---|---|
-| §2.3 main loop CAS-fail on `host_queue_lock`, no tile claimable | yes | fully idle |
-| §2.3 main loop CAS-fail on `host_queue_lock`, tile claimable | no | render is productive |
-| §2.3 `pick_tile` returns `NO_TILE` | yes, before retry | no work this iteration |
-| §2.4 phase-2 retry loop with `pending > 0` | yes, between scans | tile_lock contention |
-| §2.5 `render_try_acquire` fails | no | just pick another tile next iter |
+| §2.3 main loop, no work in either mode this iteration | yes | nothing to do; sleep before retry |
+| §2.3 productive distribute or render | no | reset `attempts = 0` |
+| §2.4 phase-2 retry loop with `pending > 0` | yes, between scans | per-tile lock contention |
 
 #### Wave-scope semantics
 
@@ -808,7 +851,7 @@ if (try_claim(&host_queue_lock)) {
   got = pop_host_queue(&batch);
   release(&host_queue_lock);
 }
-if (got) distribute_batch(&batch);
+if (got) distribute_batch(&batch, &attempts);   // §2.4
 else     render(...);
 ```
 
@@ -829,7 +872,7 @@ if (depth > 0 && try_claim(&host_queue_lock)) {
   got = pop_host_queue(&batch);
   release(&host_queue_lock);
 }
-if (got) distribute_batch(&batch);
+if (got) distribute_batch(&batch, &attempts);   // §2.4
 else     render(...);
 ```
 
@@ -929,6 +972,11 @@ Everything else is fixed-overhead or scales with primitive count rather
 than tile count. Numbers below are at a 32-bit `tile_lock` and a 32-bit
 primitive-id queue entry; see §5.3 for sizing the queue capacity `C`.
 
+**Units.** All sizes in this section use **MiB = 2²⁰ B** unless
+explicitly stated otherwise (e.g. `50 K × 96 B = 4.8 MB` in §5.5
+remains in decimal MB because that's the natural arithmetic; it
+converts to ≈ 4.6 MiB).
+
 ### 5.1 Per-Tile State
 
 Each coarse tile carries a fixed-size record:
@@ -966,18 +1014,18 @@ Total tile-state memory at common queue capacities, `B · (16 + 4·C)`:
 
 | Resolution | Tile | B | C=128 | C=256 | C=512 | C=1024 |
 |---|---|---|---|---|---|---|
-| 1080p | 32 | 2 040 | 1.03 MB | 2.02 MB | 4.02 MB | 8.00 MB |
-| 1080p | 64 | 510   | 0.26 MB | 0.51 MB | 1.00 MB | 2.00 MB |
-| 1080p | 128 | 135  | 0.07 MB | 0.13 MB | 0.27 MB | 0.53 MB |
-| 1440p | 32 | 3 600 | 1.81 MB | 3.57 MB | 7.09 MB | 14.1 MB |
-| 1440p | 64 | 920   | 0.46 MB | 0.91 MB | 1.81 MB | 3.61 MB |
-| 4K    | 32 | 8 160 | 4.11 MB | 8.09 MB | 16.1 MB | 32.0 MB |
-| 4K    | 64 | 2 040 | 1.03 MB | 2.02 MB | 4.02 MB | 8.00 MB |
-| 4K    | 128 | 510  | 0.26 MB | 0.51 MB | 1.00 MB | 2.00 MB |
+| 1080p | 32 | 2 040 | 1.03 MiB | 2.02 MiB | 4.02 MiB | 8.00 MiB |
+| 1080p | 64 | 510   | 0.26 MiB | 0.51 MiB | 1.00 MiB | 2.00 MiB |
+| 1080p | 128 | 135  | 0.07 MiB | 0.13 MiB | 0.27 MiB | 0.53 MiB |
+| 1440p | 32 | 3 600 | 1.81 MiB | 3.57 MiB | 7.09 MiB | 14.1 MiB |
+| 1440p | 64 | 920   | 0.46 MiB | 0.91 MiB | 1.81 MiB | 3.61 MiB |
+| 4K    | 32 | 8 160 | 4.11 MiB | 8.09 MiB | 16.1 MiB | 32.0 MiB |
+| 4K    | 64 | 2 040 | 1.03 MiB | 2.02 MiB | 4.02 MiB | 8.00 MiB |
+| 4K    | 128 | 510  | 0.26 MiB | 0.51 MiB | 1.00 MiB | 2.00 MiB |
 
-All comfortably below 1% of an 8 GB GPU at any sane configuration. The
-4K 32×32 with C=1024 (32 MB) is the only entry approaching "noticeable",
-and still negligible against framebuffer + textures.
+All comfortably below 1% of an 8 GiB GPU at any sane configuration.
+The 4K 32×32 with C=1024 (32 MiB) is the only entry approaching
+"noticeable", and still negligible against framebuffer + textures.
 
 ### 5.3 Sizing C
 
@@ -1017,7 +1065,7 @@ When a tile queue is full, three choices with different memory cost:
 1. **Block-on-full** (distributor spins or yields). Zero extra memory;
    potentially adds latency. The default assumed by §2.4.
 2. **Spill to global overflow pool**. One per-frame VRAM region (e.g.,
-   4 MB) holds primitives that didn't fit; a fallback rasterization
+   ~4 MiB) holds primitives that didn't fit; a fallback rasterization
    pass walks the spill list against affected tiles. Cheap memory,
    complex code path.
 3. **Bounded drop with re-rasterize.** `B/8` byte bitmap of "skipped
@@ -1034,14 +1082,15 @@ Independent of `B` and `C`, but required by the pipeline:
 
 | Buffer | Sizing | Where |
 |---|---|---|
-| Host queue (batch ring) | 256 batches × ~256 B header ≈ 64 KB | fine SVM |
-| Primitive store | P_max × ~96 B; 50K × 96 B = 4.8 MB | fine SVM |
+| Host queue (batch ring) | 256 batches × ~256 B header ≈ 64 KiB | fine SVM |
+| Primitive store | P_max × ~96 B; 50K × 96 B = 4.8 MB ≈ 4.6 MiB | fine SVM |
 | `host_queue_lock` | 4 B | fine SVM |
 | `terminate` flag | 4 B | fine SVM |
 | Heartbeat counter | 4 B | fine SVM |
+| `frame_ack[NUM_INFLIGHT_FRAMES]` (§6.9) | 4 × 16 B = 64 B | fine SVM |
 | Coarse depth (HiZ, optional) | B × 8 B | VRAM |
 | Framebuffer (color + depth) | W·H · 8 B | VRAM |
-| LDS scratch (per WG) | ~16 KB / WG | LDS (on-chip) |
+| LDS scratch (per WG) | ~16 KiB / WG | LDS (on-chip) |
 
 The primitive entry packs three vertex records of `(x, y, z, u, v)`
 in screen space (5 × 4 B = 20 B per vertex; 60 B per triangle), plus
@@ -1050,36 +1099,39 @@ triangle to leave headroom. Adding perspective-correct interpolation
 later costs one extra `1/w` per vertex (4 B), still well under
 the 128-B alignment.
 
-Fine-grained SVM total is under ~6 MB even with a generous primitive
-store — important because fine-grained SVM atomics cross PCIe and are
-significantly more expensive than VRAM atomics.
+Fine-grained SVM total ≈ **4.7 MiB** at the 50 K-prim cap (host
+queue 0.06 MiB + primitive store 4.58 MiB + locks/flags/frame_ack
+< 1 KiB; round up for page alignment). Round up to **5 MiB** for
+budgeting. This matters because fine-grained SVM atomics cross
+PCIe and are significantly more expensive than VRAM atomics.
 
 The procedural checker (§2.6.1) is closed-form — **no texture
 allocation in fine SVM or VRAM**. A real sampled-texture extension
-would add the texture data in VRAM (typical demo texture: 256×256 ×
-4 B = 256 KB) and is read-only, so it does not interact with the
-locking protocol.
+would add the texture data in VRAM (typical demo texture: 256×256
+× 4 B = **256 KiB**) and is read-only, so it does not interact
+with the locking protocol.
 
 If a hierarchical-Z extension is added (per-tile `(min, max)` depth
 in VRAM, used to skip primitives that fail the tile-Z test before
-binning), the per-tile `B × 8 B` is negligible (64 KB at 4K 32×32).
+binning), the per-tile `B × 8 B` is negligible (~64 KiB at 4K 32×32).
 
 ### 5.6 Total Pipeline Footprint
 
-Sum at the recommended **C=256** default:
+Sum at the recommended **C=256** default. Framebuffer column is
+`W·H · 8 B` (color + depth) expressed in MiB:
 
 | Resolution | Tile | Tile state | Other (fine SVM) | Other (VRAM, FB) | Total |
 |---|---|---|---|---|---|
-| 1080p | 32 | 2.02 MB | ~5.1 MB | ~16 MB | ~23 MB |
-| 1440p | 32 | 3.57 MB | ~5.1 MB | ~28 MB | ~37 MB |
-| 4K | 32 | 8.09 MB | ~5.1 MB | ~63 MB | ~76 MB |
-| 4K | 64 | 2.02 MB | ~5.1 MB | ~63 MB | ~70 MB |
+| 1080p | 32 | 2.02 MiB | ~5 MiB | 15.8 MiB | ~23 MiB |
+| 1440p | 32 | 3.57 MiB | ~5 MiB | 28.1 MiB | ~37 MiB |
+| 4K | 32 | 8.09 MiB | ~5 MiB | 63.3 MiB | ~76 MiB |
+| 4K | 64 | 2.02 MiB | ~5 MiB | 63.3 MiB | ~70 MiB |
 
 The framebuffer dominates at high resolutions; tile state is a small
 contribution. The `B/N ≥ 16` recommendation in §1 (favoring smaller
-tiles for fewer renderer-claim collisions, §6.2) costs only a few MB
-of extra VRAM — there is no memory pressure to push toward larger
-tiles.
+tiles for fewer renderer-claim collisions, §6.2) costs only a few
+MiB of extra VRAM — there is no memory pressure to push toward
+larger tiles.
 
 ## 6. Open Issues
 
@@ -1203,9 +1255,14 @@ points:
 
 - §2.4 (distributor): forward `batch.frame_id` into each `TileEntry`.
 - §2.5 (renderer): add a phase-4 `ack_drain` that flushes a per-WG
-  SGPR accumulator into a global `frame_ack[F % N].rendered`.
+  SGPR accumulator into a global
+  `frame_ack[FRAME_SLOT(F)].rendered`, where
+  `FRAME_SLOT(F) = F % NUM_INFLIGHT_FRAMES` (`frame-completion-detection.md`
+  §5.1). `NUM_INFLIGHT_FRAMES` is the host's frame ring depth (2–4),
+  unrelated to `N` (resident WG count).
 - §2.7 (host push): host seals the frame by storing
-  `frame_ack[F % N].expected = N_F` after pushing all batches.
+  `frame_ack[FRAME_SLOT(F)].expected = N_F` after pushing all
+  batches, where `N_F` is the primitive count of frame F.
 - Tile queue entry size grows from 4 B to 8 B (or pack `frame_id`
   into high bits of `prim_id`); revisit §5.1 memory tables.
 
@@ -1226,16 +1283,32 @@ Host sequence at end of stream (app shutdown):
    works; `terminate = 1` is cheaper.
 3. Wait on the dispatch fence.
 
-Workgroup exit conditions:
+Workgroup exit conditions: the §2.3 main loop already encodes the
+exit predicate. A WG breaks out of the loop on the iteration where
+both modes returned "no work" *and* `terminate == 1`:
 
-- Any WG that observes `terminate == 1` *and* finds no work in either
-  mode (host queue empty, no `tile_pending[t] > 0`) broadcasts an
-  exit signal via LDS, `s_barrier`s, all waves exit.
+- `try_claim(&host_queue_lock)` either failed or the popped batch
+  was empty;
+- `pick_tile()` returned `NO_TILE`, or the chosen tile was already
+  claimed by another renderer;
+- `terminate == 1`.
 
-The bin-queue-empty check after `terminate` ensures all rendering
-completes before exit. The distributor does not need to broadcast
-`END_OF_STREAM` into tile queues; the global flag is sufficient and
-avoids a fan-out write across all bins.
+This is the "drained" condition: with the host no longer pushing,
+host queue empty, and no tile that this WG can claim (every
+remaining tile is either empty or already mid-render), there is
+nothing left for this WG to do. Other WGs that still have a tile
+locked finish their phase-3 rasterize and reach the same predicate
+on the next iteration. The dispatch fence signals once every WG
+has exited.
+
+The exit is wave-uniform because the §2.3 loop is wave-uniform —
+lane 0 of wave 0 performs the atomic loads and the result is
+broadcast via LDS, so all waves of the WG see the same "exit"
+decision and reach the kernel return together.
+
+The distributor does not need to broadcast `END_OF_STREAM` into
+tile queues; the global flag is sufficient and avoids a fan-out
+write across all bins.
 
 For per-frame (rather than per-app) completion against this
 persistent megakernel, see `frame-completion-detection.md`. The
@@ -1336,6 +1409,27 @@ ring *while* the dispatch is in flight. Concretely:
 
 If any of these are already in libkfd, they need no work; this is a
 checklist for what the demo depends on.
+
+### 7.7 Assumptions
+
+The design depends on a handful of hardware/driver properties that
+are believed-true on AMDGPU but should be **validated on every
+target ASIC** before relying on them in production. None of these
+are fundamental constants of the architecture; each could in
+principle change with a kernel/driver/firmware update.
+
+| Assumption | Where used | What breaks if false |
+|---|---|---|
+| Fine-grained coherent SVM with PCIe atomics on the same cache lines as host code (GFX9–GFX12). | Host queue, `host_queue_lock`, `terminate`, heartbeat, `frame_ack`. | Host↔GPU lock protocol; per-frame ack. Fall back to coarse-grained SVM + explicit flushes (slower). |
+| The KFD GPU watchdog can be raised, disabled, or bypassed via a priority class for persistent compute queues. | §7.4. | The kernel hits the watchdog at ~1–10 s and is reset. No clean fallback; would need to re-architect as kernel-per-frame. |
+| `s_sleep` is supported on the target gen and its `simm16` cycle counts approximate the documented values. | §2.8 backoff ladder. | `wg_backoff` becomes a busy-spin (worst case: cache-fabric saturation). Fallback: `s_nop` chain or LDS-only spin. |
+| `RELEASE_MEM` (`INT_SEL=2`) and `WAIT_REG_MEM` PM4 packets have stable cross-gen semantics on a non-megakernel helper queue. | `frame-completion-detection.md` §5.8 interrupt-driven wake. | Interrupt-driven wake does not work; fall back to polling host wait (§5.3 of frame-completion). |
+| No compute-queue preemption mid-kernel (lock-holder eviction). | §6.8. | A descheduled WG holds a lock indefinitely; lock-holder watchdog needed. |
+| `s_sendmsg sendmsg(MSG_INTERRUPT)` is **not** a generic compute-kernel→KFD-event wake mechanism (only the trap handler routes it). | §5.8 of frame-completion explicitly documents this; design doesn't rely on it. | (No design impact; assumption listed for completeness.) |
+
+Each row is a one-liner; the full discussion lives in the section
+referenced. Bring-up should explicitly check each on the target
+GPU before running anything beyond stage 0.
 
 ## 8. Concrete Refinement (If Implemented)
 

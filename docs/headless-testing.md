@@ -7,6 +7,12 @@ piping primitives through the kernel and reading the framebuffer
 back to host memory. This is the configuration that runs in CI,
 on remote AMDGPU dev boxes, and during single-step debugging.
 
+**Performance and budget numbers in this document are
+targets / order-of-magnitude estimates**, not measurements. The
+~1 ms PCIe readback, the < 5 s / 30 s CI budgets, and the ≤ 10 ms
+termination bound (§3.5) are policy/design targets that real
+runs will calibrate against.
+
 ## 1. Why Headless First
 
 The presentation path (window, swapchain, vsync, flip) is
@@ -132,13 +138,21 @@ Variants:
   per-WG-SGPR accumulator flush.
 - **Frame straddling host backoff**: queue is full when the host
   tries to seal `expected`. Verifies that the seal-after-push
-  ordering (§5.4 of frame-completion-detection) is respected.
+  ordering (§5.3 of frame-completion-detection) is respected.
 
 ### 3.5 Termination Tests
 
 Set the `terminate` flag (§7.1 of bin-ownership) and verify the
-kernel exits within a bounded time (≤ 1 ms at the recommended
-heartbeat threshold). Variants:
+kernel exits within a bounded time. The bound is independent of
+the host heartbeat threshold (§7.3 of bin-ownership; that's
+hang-detection, not exit-latency): a WG sees `terminate` on the
+*next* main-loop iteration and exits as soon as it has no claimed
+tile. Worst case is therefore one in-flight rasterize completion
+(estimated ~50 μs per coarse tile, §2.5) plus one `wg_backoff` cap
+(~2 μs, §2.8). Test target: **≤ 10 ms** of wall time between
+`terminate = 1` and dispatch fence signal, with a generous margin
+over the per-WG worst case to absorb dispatch-fence-completion
+latency. Variants:
 
 - Terminate from idle: no work in flight.
 - Terminate mid-frame: half a frame's primitives are queued. The
@@ -175,23 +189,47 @@ headless_runner --scene=<file>          # primitive list, JSON or binary
                 --counters=<file>       # dump debug counters
                 --tile=<size>           # 32 | 64 | 128
                 --resolution=<WxH>      # default 1920x1080
+                --mode=<stage0|stage1|stage2|stage3>
 ```
 
-Internally:
+`--mode` selects the bring-up stage from `bin-ownership-pipeline-proposal.md`
+§9. The runner has stage-specific init and per-frame loops that
+share the kernel binary but differ in how the host feeds it and
+how it waits for completion.
 
-1. Init libkfd (`kfd::Compute`), allocate fine-grained SVM regions
-   (host queue, primitive store, locks, counters), allocate VRAM
-   framebuffer.
+### 4.1 Stage 0 (non-persistent, single-shot per frame)
+
+1. Init libkfd (`kfd::Compute`), allocate VRAM framebuffer.
+2. Per frame:
+   1. Build the entire frame's primitive list in a VRAM upload
+      buffer.
+   2. Dispatch the (non-persistent) megakernel; wait on the
+      dispatch fence.
+   3. Optionally read the framebuffer to host, hash, or dump.
+
+No fine-grained-SVM ring, no `terminate` flag, no `frame_ack`
+counters. This is the smoke runner for stages 0.x and validates
+the bin-ownership locks (§3.1, §3.2 above).
+
+### 4.2 Stage 1+ (persistent, with `terminate` and per-frame ack)
+
+1. Init libkfd, allocate fine-grained SVM regions (host queue
+   batch ring, primitive store, locks, `frame_ack` slots,
+   counters), allocate VRAM framebuffer.
 2. Load the kernel binary, dispatch the persistent megakernel.
-3. Per frame: build batches from the scene, push via the host
-   protocol (§2.7), wait for completion (§5 of
-   frame-completion-detection).
-4. Optionally read the framebuffer to host, hash or dump.
-5. Set `terminate=1`, wait for the kernel to drain, validate
+3. Per frame:
+   1. Build batches.
+   2. Push via the host protocol (§2.7 of bin-ownership for
+      stage 2+; a simple `memcpy` upload for stage 1).
+   3. Wait for completion (§5 of frame-completion-detection;
+      polling for stage 1–2, KFD-signal interrupt for stage 3).
+   4. Optionally read the framebuffer to host, hash, or dump.
+4. Set `terminate=1`, wait for the kernel to drain, validate
    counters and trap log.
 
 Tests are thin wrappers around the runner: a scene file, expected
-hash, expected counter ranges. New tests don't need new binaries.
+hash, expected counter ranges, mode flag. New tests don't need new
+binaries.
 
 ## 5. Determinism and Tolerance
 
