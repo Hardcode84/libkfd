@@ -11,7 +11,6 @@
 #include "libkfd/detail/elf.h"
 #include "libkfd/libkfd.h"
 
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -87,18 +86,18 @@ struct PersistentControl {
   uint32_t ready;
   uint32_t frame_id;
   uint32_t active_slot;
-  uint32_t init_cursor;
-  uint32_t init_tiles_done;
+  uint32_t active_cursor;
   uint32_t tiles_done;
   uint32_t frame_done;
-  uint32_t tile_count;
+  uint32_t active_count;
 };
 
 struct ClaimFrameArgs {
   const DemoPrimitive *prims;
   const uint32_t *tile_indices;
   const TileRange *tile_ranges;
-  uint32_t *tile_claims;
+  const uint32_t *active_tiles;
+  uint32_t *active_cursor;
   uint32_t *color;
   float *depth;
   uint32_t width;
@@ -110,8 +109,7 @@ struct ClaimFrameArgs {
   uint32_t clear_color;
   float clear_depth;
   uint32_t clear_only;
-  uint32_t tile_count;
-  uint32_t frame_epoch;
+  uint32_t active_count;
 };
 
 struct PersistentArgs {
@@ -119,9 +117,9 @@ struct PersistentArgs {
   const DemoPrimitive *prims;
   const uint32_t *tile_indices;
   const TileRange *tile_ranges;
-  uint32_t *tile_claims0;
-  uint32_t *tile_claims1;
-  uint32_t *tile_claims2;
+  const uint32_t *active_tiles0;
+  const uint32_t *active_tiles1;
+  const uint32_t *active_tiles2;
   uint32_t *color0;
   uint32_t *color1;
   uint32_t *color2;
@@ -156,8 +154,8 @@ static const DemoBinary rasterdemo_kernels[] = {
 
 struct Framebuffer {
   kfd::Buffer color;
-  kfd::Buffer tile_claims;
-  kfd::Buffer frame_claims;
+  kfd::Buffer active_tiles;
+  kfd::Buffer active_cursor;
   kfd::DMABuffer dmabuf;
   kfd::Buffer kernarg;
   kfd::Buffer claim_kernarg;
@@ -825,7 +823,7 @@ int main(int argc, char **argv) {
   size_t tile_indices_bytes = max_tile_indices * sizeof(uint32_t);
   size_t tile_ranges_bytes = static_cast<size_t>(tiles_x) * tiles_y *
                              sizeof(TileRange);
-  size_t tile_claims_bytes =
+  size_t active_tiles_bytes =
       static_cast<size_t>(tiles_x) * tiles_y * sizeof(uint32_t);
   auto prim_buf = KFD_EXPECT(kfd::Buffer::allocate(
       dev, kfd::detail::align_up(prim_bytes, kfd::detail::page_size()),
@@ -855,14 +853,18 @@ int main(int argc, char **argv) {
     fbs[i].color = KFD_EXPECT(kfd::Buffer::allocate(
         dev, color_bytes, color_type, color_flags));
     KFD_EXPECT(fbs[i].color.map(dev));
-    fbs[i].tile_claims = KFD_EXPECT(kfd::Buffer::allocate(
-        dev, kfd::detail::align_up(tile_claims_bytes, kfd::detail::page_size()),
-        kfd::MemType::VRAM, kfd::MemFlags::WRITABLE));
-    KFD_EXPECT(fbs[i].tile_claims.map(dev));
-    fbs[i].frame_claims = KFD_EXPECT(kfd::Buffer::allocate(
-        dev, kfd::detail::align_up(tile_claims_bytes, kfd::detail::page_size()),
+    fbs[i].active_tiles = KFD_EXPECT(kfd::Buffer::allocate(
+        dev, kfd::detail::align_up(active_tiles_bytes, kfd::detail::page_size()),
         kfd::MemType::GTT, HOST_GTT_FLAGS));
-    KFD_EXPECT(fbs[i].frame_claims.map(dev));
+    KFD_EXPECT(fbs[i].active_tiles.map(dev));
+    auto *active_tiles = static_cast<uint32_t *>(fbs[i].active_tiles.data());
+    // The current demo clears as part of tile rendering, so every tile remains
+    // active until clearing is split into its own pass.
+    for (uint32_t tile = 0; tile < tile_count; ++tile)
+      active_tiles[tile] = tile;
+    fbs[i].active_cursor = KFD_EXPECT(kfd::Buffer::allocate(
+        dev, kfd::detail::page_size(), kfd::MemType::GTT, HOST_GTT_FLAGS));
+    KFD_EXPECT(fbs[i].active_cursor.map(dev));
     if (!software_present && !headless)
       fbs[i].dmabuf = KFD_EXPECT(kfd::DMABuffer::create(fbs[i].color));
     fbs[i].kernarg = KFD_EXPECT(frame_kernel.alloc());
@@ -873,6 +875,7 @@ int main(int argc, char **argv) {
       KFD_EXPECT(win->import_buffer(i, fbs[i].dmabuf.fd(), fbs[i].color.size(),
                                     stride));
   }
+  kfd::detail::memory_barrier();
 
   auto control_buf = KFD_EXPECT(kfd::Buffer::allocate(
       dev, kfd::detail::align_up(sizeof(PersistentControl),
@@ -893,9 +896,9 @@ int main(int argc, char **argv) {
       .prims = static_cast<const DemoPrimitive *>(prim_buf.data()),
       .tile_indices = static_cast<const uint32_t *>(tile_indices_buf.data()),
       .tile_ranges = static_cast<const TileRange *>(tile_ranges_buf.data()),
-      .tile_claims0 = static_cast<uint32_t *>(fbs[0].tile_claims.data()),
-      .tile_claims1 = static_cast<uint32_t *>(fbs[1].tile_claims.data()),
-      .tile_claims2 = static_cast<uint32_t *>(fbs[2].tile_claims.data()),
+      .active_tiles0 = static_cast<const uint32_t *>(fbs[0].active_tiles.data()),
+      .active_tiles1 = static_cast<const uint32_t *>(fbs[1].active_tiles.data()),
+      .active_tiles2 = static_cast<const uint32_t *>(fbs[2].active_tiles.data()),
       .color0 = static_cast<uint32_t *>(fbs[0].color.data()),
       .color1 = static_cast<uint32_t *>(fbs[1].color.data()),
       .color2 = static_cast<uint32_t *>(fbs[2].color.data()),
@@ -929,7 +932,7 @@ int main(int argc, char **argv) {
     std::printf("Kernel mode: persistent (%u workgroups, %ux%u threads)\n",
                 persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
   } else if (kernel_mode == KernelMode::PerFrame) {
-    std::printf("Kernel mode: per-frame tile claim (%u workgroups, %ux%u "
+    std::printf("Kernel mode: per-frame active tile queue (%u workgroups, %ux%u "
                 "threads)\n",
                 persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
   } else {
@@ -1009,17 +1012,18 @@ int main(int argc, char **argv) {
         return 1;
       }
     } else if (kernel_mode == KernelMode::PerFrame) {
-      uint32_t frame_epoch = (frame + 1) & 0x7fffffffu;
-      auto *frame_claims =
-          static_cast<uint32_t *>(fbs[current].frame_claims.data());
-      std::fill_n(frame_claims, static_cast<size_t>(tile_count), frame_epoch);
+      auto *active_cursor =
+          static_cast<uint32_t *>(fbs[current].active_cursor.data());
+      __atomic_store_n(active_cursor, 0u, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
 
       ClaimFrameArgs claim_args{
           .prims = args.prims,
           .tile_indices = args.tile_indices,
           .tile_ranges = args.tile_ranges,
-          .tile_claims = frame_claims,
+          .active_tiles =
+              static_cast<const uint32_t *>(fbs[current].active_tiles.data()),
+          .active_cursor = active_cursor,
           .color = args.color,
           .depth = args.depth,
           .width = args.width,
@@ -1031,8 +1035,7 @@ int main(int argc, char **argv) {
           .clear_color = args.clear_color,
           .clear_depth = args.clear_depth,
           .clear_only = clear_only ? 1u : 0u,
-          .tile_count = tile_count,
-          .frame_epoch = frame_epoch,
+          .active_count = tile_count,
       };
       claim_frame_kernel.fill(fbs[current].claim_kernarg, claim_args,
                               persistent_cfg);
@@ -1053,10 +1056,9 @@ int main(int argc, char **argv) {
     } else {
       uint32_t frame_id = frame + 1;
       __atomic_store_n(&control->tiles_done, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->init_cursor, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->init_tiles_done, 0u, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->active_cursor, 0u, __ATOMIC_RELEASE);
       __atomic_store_n(&control->active_slot, current, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->tile_count, tile_count, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->active_count, tile_count, __ATOMIC_RELEASE);
       __atomic_store_n(&control->frame_id, frame_id, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
       __atomic_store_n(&control->ready, 1u, __ATOMIC_RELEASE);
@@ -1068,17 +1070,15 @@ int main(int argc, char **argv) {
         if (std::chrono::steady_clock::now() > deadline) {
           std::fprintf(stderr,
                        "error: frame %u persistent GPU wait timed out "
-                       "(ready=%u frame_id=%u init_cursor=%u "
-                       "init_tiles_done=%u tiles_done=%u frame_done=%u "
-                       "tile_count=%u)\n",
+                       "(ready=%u frame_id=%u active_cursor=%u "
+                       "tiles_done=%u frame_done=%u active_count=%u)\n",
                        frame, __atomic_load_n(&control->ready, __ATOMIC_ACQUIRE),
                        __atomic_load_n(&control->frame_id, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->init_cursor, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->init_tiles_done,
+                       __atomic_load_n(&control->active_cursor,
                                        __ATOMIC_ACQUIRE),
                        __atomic_load_n(&control->tiles_done, __ATOMIC_ACQUIRE),
                        __atomic_load_n(&control->frame_done, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->tile_count, __ATOMIC_ACQUIRE));
+                       __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE));
           __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
           KFD_EXPECT(compute.signal(shutdown_signal));
           (void)shutdown_signal.wait(kfd::Condition::EQ, 0,

@@ -38,7 +38,7 @@ struct PersistentFrame {
   const struct DemoPrimitive *prims;
   const unsigned *tile_indices;
   const struct TileRange *tile_ranges;
-  volatile unsigned *tile_claims;
+  const volatile unsigned *active_tiles;
   unsigned *color;
   float *depth;
   unsigned width;
@@ -56,7 +56,8 @@ struct ClaimFrameArgs {
   const struct DemoPrimitive *prims;
   const unsigned *tile_indices;
   const struct TileRange *tile_ranges;
-  volatile unsigned *tile_claims;
+  const volatile unsigned *active_tiles;
+  volatile unsigned *active_cursor;
   unsigned *color;
   float *depth;
   unsigned width;
@@ -68,8 +69,7 @@ struct ClaimFrameArgs {
   unsigned clear_color;
   float clear_depth;
   unsigned clear_only;
-  unsigned tile_count;
-  unsigned frame_epoch;
+  unsigned active_count;
 };
 
 struct PersistentControl {
@@ -77,11 +77,10 @@ struct PersistentControl {
   volatile unsigned ready;
   volatile unsigned frame_id;
   volatile unsigned active_slot;
-  volatile unsigned init_cursor;
-  volatile unsigned init_tiles_done;
+  volatile unsigned active_cursor;
   volatile unsigned tiles_done;
   volatile unsigned frame_done;
-  volatile unsigned tile_count;
+  volatile unsigned active_count;
 };
 
 struct PersistentArgs {
@@ -89,9 +88,9 @@ struct PersistentArgs {
   const struct DemoPrimitive *prims;
   const unsigned *tile_indices;
   const struct TileRange *tile_ranges;
-  volatile unsigned *tile_claims0;
-  volatile unsigned *tile_claims1;
-  volatile unsigned *tile_claims2;
+  const volatile unsigned *active_tiles0;
+  const volatile unsigned *active_tiles1;
+  const volatile unsigned *active_tiles2;
   unsigned *color0;
   unsigned *color1;
   unsigned *color2;
@@ -132,22 +131,13 @@ static unsigned shade_checker(float u, float v) {
   return ((iu ^ iv) & 1u) ? 0xffe0e0e0u : 0xff202020u;
 }
 
-static unsigned pick_tile(volatile unsigned *tile_claims, unsigned tile_count,
-                          unsigned frame_epoch) {
-  unsigned wg = __gpu_block_id_x();
-  unsigned start = (wg * 2654435761u) % tile_count;
-  unsigned claimed = frame_epoch | 0x80000000u;
-  for (unsigned off = 0; off < tile_count; ++off) {
-    unsigned tile = start + off;
-    if (tile >= tile_count)
-      tile -= tile_count;
-    unsigned expected = frame_epoch;
-    if (__atomic_compare_exchange_n(&tile_claims[tile], &expected, claimed,
-                                    false, __ATOMIC_ACQ_REL,
-                                    __ATOMIC_ACQUIRE))
-      return tile;
-  }
-  return tile_count;
+static unsigned pop_active_tile(volatile unsigned *cursor,
+                                const volatile unsigned *active_tiles,
+                                unsigned active_count) {
+  unsigned index = __atomic_fetch_add(cursor, 1u, __ATOMIC_ACQ_REL);
+  if (index >= active_count)
+    return 0xffffffffu;
+  return __atomic_load_n(&active_tiles[index], __ATOMIC_ACQUIRE);
 }
 
 __gpu_kernel void rasterdemo_probe(struct ProbeArgs args) {
@@ -266,10 +256,11 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
   for (;;) {
     if (tid == 0)
       lds_claimed_tile =
-          pick_tile(args.tile_claims, args.tile_count, args.frame_epoch);
+          pop_active_tile(args.active_cursor, args.active_tiles,
+                          args.active_count);
     __gpu_sync_threads();
     unsigned tile = lds_claimed_tile;
-    if (tile >= args.tile_count)
+    if (tile == 0xffffffffu)
       break;
 
     if (tid == 0) {
@@ -323,9 +314,9 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     f.prims = args.prims;
     f.tile_indices = args.tile_indices;
     f.tile_ranges = args.tile_ranges;
-    f.tile_claims = slot == 0 ? args.tile_claims0
-                    : slot == 1 ? args.tile_claims1
-                                : args.tile_claims2;
+    f.active_tiles = slot == 0 ? args.active_tiles0
+                     : slot == 1 ? args.active_tiles1
+                                 : args.active_tiles2;
     f.color = slot == 0 ? args.color0 : slot == 1 ? args.color1 : args.color2;
     f.depth = args.depth;
     f.width = args.width;
@@ -337,34 +328,17 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     f.clear_color = args.clear_color;
     f.clear_depth = args.clear_depth;
     f.clear_only = args.clear_only;
-    unsigned tile_count = __atomic_load_n(&args.control->tile_count,
-                                          __ATOMIC_ACQUIRE);
-    unsigned frame_epoch = frame & 0x7fffffffu;
+    unsigned active_count = __atomic_load_n(&args.control->active_count,
+                                            __ATOMIC_ACQUIRE);
 
-    if (tid == 0) {
-      for (;;) {
-        unsigned tile =
-            __atomic_fetch_add(&args.control->init_cursor, 1u,
-                               __ATOMIC_ACQ_REL);
-        if (tile >= tile_count)
-          break;
-        __atomic_exchange_n(&f.tile_claims[tile], frame_epoch,
-                            __ATOMIC_ACQ_REL);
-        __atomic_fetch_add(&args.control->init_tiles_done, 1u,
-                           __ATOMIC_ACQ_REL);
-      }
-    }
-    while (__atomic_load_n(&args.control->init_tiles_done, __ATOMIC_ACQUIRE) <
-           tile_count) {
-      __builtin_amdgcn_s_sleep(4);
-    }
     for (;;) {
       if (tid == 0)
         lds_claimed_tile =
-            pick_tile(f.tile_claims, tile_count, frame_epoch);
+            pop_active_tile(&args.control->active_cursor, f.active_tiles,
+                            active_count);
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
-      if (tile >= tile_count)
+      if (tile == 0xffffffffu)
         break;
       if (tid == 0) {
         struct TileRange range = f.tile_ranges[tile];
@@ -394,7 +368,7 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
             __atomic_fetch_add(&args.control->tiles_done, 1u,
                                __ATOMIC_ACQ_REL) +
             1u;
-        if (done == tile_count) {
+        if (done == active_count) {
           __atomic_store_n(&args.control->frame_done, frame, __ATOMIC_RELEASE);
           __atomic_store_n(&args.control->ready, 0u, __ATOMIC_RELEASE);
         }
