@@ -12,22 +12,35 @@ modes:
 2. **Render mode**: drain one tile's queue, rasterize the
    primitives, write the framebuffer slice for that tile.
 
-Mutual exclusion is enforced via two kinds of ownership locks:
+Mutual exclusion is enforced via three kinds of ownership locks plus
+one global ready ring:
 
 - One **host queue lock** (binary), shared between the host and GPU
   WGs. Whichever entity (the host pushing, or a distributor WG
   popping) holds the flag has exclusive access to the host queue's
   pointers and slots. At most one party touches the queue at a time.
-- B **tile locks** (3-state, two independent bits — §2.2.2), one per
-  coarse bin. The two bits separately track *queue access* (single-
-  writer/reader) and *rasterization* (single-renderer-per-tile) so a
-  distributor can push new primitives to a tile while a renderer is
-  rasterizing it.
+- B **per-tile `queue_lock`s** (binary), one per coarse bin. Held only
+  while a distributor appends a bucket to that tile's primitive buffer
+  or a renderer drains it into LDS. Hold time is short (~hundreds of
+  ns).
+- B **per-tile `render_lock`s** (binary), one per coarse bin. Held by
+  a renderer for the entire drain-rasterize phase on that tile. Hold
+  time is long (tens of µs). The two binary locks are independent: a
+  distributor can append to a tile while a renderer is rasterizing the
+  prims drained earlier.
+- One global **`ready` ring** of tile IDs. A distributor that pushes
+  to a tile that was empty appends the tile ID; a renderer pops a tile
+  ID instead of scanning. Pop is O(1). A per-tile `in_ready` flag
+  coalesces duplicate enqueues and is cleared inside `queue_lock` on
+  the renderer's way out.
 
 The active distributor identity rotates as WGs release the host queue
-lock and other WGs (or the host) re-claim it. Each tile cycles
-through queue-access and rendering states independently and can
-overlap them.
+lock and other WGs (or the host) re-claim it. Each tile's
+`queue_lock` / `render_lock` / `in_ready` state evolves independently;
+distribution and rasterization on the same tile can overlap.
+
+This design replaces an earlier 3-state per-tile lock plus
+whole-screen `pick_tile()` scan; see §1.1 for why the change.
 
 Companion docs:
 
@@ -74,11 +87,60 @@ with:
 | 4K | 128×128 | ~510 | 6   |
 
 The model is robust at `B/N ≥ 16` (random tile claim is essentially
-uncontended). It works at `4 ≤ B/N ≤ 16` with picking heuristics
-(§4). It breaks down below `B/N < 4` — at that point a fixed-role
-partitioning scheme (one or a few WGs as distributors, the rest as
-renderers) becomes the better trade. The 1080p teapot demo lands at
-`B/N ≈ 25` with 32×32 bins, comfortably inside the robust regime.
+uncontended). It works at `4 ≤ B/N ≤ 16` with the ready ring as the
+work-discovery primitive (§4). It breaks down below `B/N < 4` — at
+that point a fixed-role partitioning scheme (one or a few WGs as
+distributors, the rest as renderers) becomes the better trade. The
+1080p teapot demo lands at `B/N ≈ 25` with 32×32 bins, comfortably
+inside the robust regime.
+
+### 1.1 What Changed Since The First Prototype
+
+The first cut of this design (committed prior to 2026-04) used a
+**3-state per-tile lock** (`TILE_QLOCK | TILE_RENDER` bits) and a
+**whole-screen `pick_tile()` scan**: render-mode WGs walked all B
+tiles looking for a fully-UNLOCKED non-empty one, then CAS'd to
+acquire. We prototyped that shape and found two real problems:
+
+- **Renderer wakeup is O(B) per pick.** At 1080p / 32×32, B ≈ 2 040
+  tiles. Most of them are empty most of the time. A renderer ate a
+  full ~100 ns per tile probed before finding work — a few µs per
+  pick on a busy frame, an order of magnitude more on a sparse one.
+  Aggregated across N ≈ 80 renderer WGs the scan dominated.
+- **The 3-state lock is hard to reason about.** Two independent bits
+  give four reachable states, six legal transitions, and three
+  separate CAS callsites. Verifying that the renderer's "drain → keep
+  RENDER, drop QLOCK" CAS does not race with a concurrent distributor
+  push, that no thread observes the impossible `0x3 → 0x0` transition,
+  and that the `atomicAnd(~bit)` releases preserve memory ordering
+  took more proof per kB of code than the rest of the kernel
+  combined.
+
+This revision replaces both:
+
+| Old design                        | This revision                           |
+|-----------------------------------|-----------------------------------------|
+| `pick_tile()` scans all B tiles   | `ready.pop()` returns any non-empty tile in O(1) |
+| 3-state lock (2 bits, 4 values)   | Two independent binary locks (`queue_lock`, `render_lock`) |
+| `tile_pending` counter per tile   | `in_ready` flag per tile (1 bit's worth) |
+| Renderer must find UNLOCKED state | Renderer always tries to acquire `render_lock` on the popped tile; CAS-fail re-pushes |
+
+The two fast-path properties the user originally asked for fall out
+directly:
+
+1. **Distributor finds the tile to push to in O(1).** It already
+   knows the target tile from coarse binning; it acquires that tile's
+   `queue_lock` (one CAS), appends the bucket via `memcpy`, releases
+   (one atomicExch). On the empty→non-empty transition it CASes
+   `in_ready` and pushes the tile ID into the ready ring.
+2. **Renderer finds any non-empty tile in O(1).** It pops a tile ID
+   from the global ready ring. No scan. If `render_lock` is contended
+   by another renderer, the renderer re-pushes the tile ID and
+   returns — bounded by a single CAS plus a single ring push.
+
+§2.2 details the lock semantics; §2.5 walks through the renderer
+drain-rasterize loop and the in_ready handover that prevents lost
+wakeups.
 
 ## 2. Architecture
 
@@ -90,31 +152,33 @@ Host                                GPU (one megakernel)
 ┌──────────────┐                    ┌─────────────────────────────────────┐
 │ scene walk   │                    │ N symmetric WGs (no role split)     │
 │ + batching   │ ◄─acq/rel host_q─► │  loop:                              │
-│ push under   │ ─CAS lock─►        │    batch = NULL                     │
-│ host_q_lock  │                    │    if try_claim(host_queue_lock):   │
-└──────────────┘                    │      batch = pop_host_queue()       │
-                    ┌──────────┐    │      release(host_queue_lock)       │
-                    │ Host     │ ◄──┤    if batch:                        │
-                    │ queue    │    │      distribute_batch() {           │
-                    │ +shared  │    │        bucket by tile in LDS        │
-                    │ lock     │    │        for each bucket:             │
-                    └──────────┘    │          claim tile_lock briefly,   │
-                                    │          push, release              │
-                                    │      }                              │
-                                    │    else:                            │
-                                    │      tile = pick_tile()             │
-                                    │      if render_try_acquire(tile):   │
-                                    │        render(tile)                 │
-                                    │        release tile_lock[tile]      │
+│ push under   │ ─CAS lock─►        │    if try_claim(host_queue_lock):   │
+│ host_q_lock  │                    │      batch = pop_host_queue()       │
+└──────────────┘                    │      release(host_queue_lock)       │
+                    ┌──────────┐    │      if batch:                      │
+                    │ Host     │ ◄──┤        distribute_batch() {         │
+                    │ queue    │    │          bucket by tile in LDS      │
+                    │ +shared  │    │          for each non-empty bucket: │
+                    │ lock     │    │            acquire queue_lock       │
+                    └──────────┘    │            append, was_empty?       │
+                                    │            release queue_lock       │
+                                    │            if was_empty:            │
+                                    │              CAS in_ready 0→1       │
+                                    │              ready.push(tile_id)    │
+                                    │        }                            │
+                                    │    elif ready.pop(&T):              │
+                                    │      render(T)  // drain-rasterize  │
                                     └─────────────────────────────────────┘
-                                                ▲
-                                                │
-                                       ┌────────┴────────┐
-                                       │ Per-tile state  │
-                                       │  - queue        │
-                                       │  - lock (3-state)│
-                                       │ (B of these)    │
-                                       └─────────────────┘
+                                                ▲                ▲
+                                                │                │
+                          ┌─────────────────────┴───┐  ┌─────────┴────────┐
+                          │ Per-tile state          │  │ Global `ready`   │
+                          │  buf[CAP], head         │  │ ring of tile IDs │
+                          │  queue_lock (binary)    │◄─┤ MPMC: distribs   │
+                          │  render_lock (binary)   │  │ push, renderers  │
+                          │  in_ready (1 bit)       │  │ pop. Coalesced   │
+                          │ (B of these)            │  │ via in_ready.    │
+                          └─────────────────────────┘  └──────────────────┘
                                                 │
                                                 ▼
                                        framebuffer
@@ -133,46 +197,70 @@ Key properties:
   one operation; the lock-holder identity rotates dynamically. Pops
   release the lock immediately so multiple WGs can run
   `distribute_batch` concurrently after popping (§2.3).
-- Each tile is gated by a 3-state lock (§2.2.2): a queue-access bit
-  (push or drain) and an independent rendering bit. Distributor pushes
-  and renderer rasterization can overlap on the same tile; only the
-  brief queue-access window is mutually exclusive.
+- Each tile is gated by **two independent binary locks** (§2.2.2):
+  `queue_lock` (brief; held while mutating the tile's primitive
+  buffer) and `render_lock` (long; held across the renderer's full
+  drain-rasterize phase). Because they are independent, a distributor
+  appending more primitives can run concurrently with a renderer
+  rasterizing the prims drained earlier.
+- The **global `ready` ring** holds tile IDs that may have pending
+  primitives. Distributor's empty→non-empty transition pushes the
+  tile ID; renderer pops one in O(1). The per-tile `in_ready` flag
+  prevents duplicate enqueues and is cleared by the renderer inside
+  `queue_lock` when its drain finds the tile empty (§2.5).
 - WG roles are dynamic per iteration, not fixed by `wg_id`.
 
-### 2.2 The Two Lock Types
+### 2.2 The Lock Types
 
-The host queue lock is a plain binary lock, **placed in fine-grained
-SVM** so both the host and GPU WGs can CAS it. Tile locks are 3-state
-with two independent ownership bits, in **VRAM** (GPU-only).
+Three locks plus one global ready ring. All three locks are plain
+binary locks — a `uint32_t` taking values 0 (UNLOCKED) or 1 (LOCKED),
+acquired by `atomicCAS(0, 1)` and released by `atomicExch(_, 0)` after
+a release fence. The same `try_claim` / `release` helpers are used
+everywhere:
+
+```c
+__device__ /* or host */
+bool try_claim(_Atomic uint32_t *lock) {
+  return atomicCAS(lock, 0, 1) == 0;
+}
+
+__device__ /* or host */
+void release(_Atomic uint32_t *lock) {
+  atomic_thread_fence(memory_order_release);
+  atomicExch(lock, 0);
+}
+```
+
+Per-tile state lives in **VRAM** (GPU-only); the host queue lock is in
+**fine-grained SVM** so both sides can CAS it.
 
 ```c
 // fine-grained SVM (host + GPU access)
-volatile _Atomic uint32_t host_queue_lock;     // 0 = UNLOCKED, 1 = LOCKED
+volatile _Atomic uint32_t host_queue_lock;
 
 // VRAM (GPU-only)
-__device__ uint32_t tile_lock[B];              // 2-bit field, see below
+struct Tile {
+  _Atomic uint32_t queue_lock;     // brief: protects buf/head mutations
+  _Atomic uint32_t render_lock;    // long:  protects rasterization
+  _Atomic uint32_t in_ready;       // 1 = queued in `ready` OR a renderer is draining
+  uint32_t         head;           // current count in buf[]
+  TileEntry        buf[CAP];       // primitive ids + frame_id, packed (see §5.1)
+};
+__device__ struct Tile tile[B];
+
+__device__ MPMCRing<uint32_t> ready;    // global ring of tile IDs
 ```
+
+The buffer is treated as a **stack**, not a ring: distributors append
+at `head`, the renderer drains the entire `[0, head)` slice into LDS
+in one shot and resets `head = 0`. This drops the FIFO `tail` pointer
+that the previous design carried, simplifying the queue mutations to a
+single counter.
 
 #### 2.2.1 Host queue lock (binary, host+GPU shared)
 
-```c
-// fine-grained SVM, addressable from both host and GPU
-volatile _Atomic uint32_t host_queue_lock;     // 0 = UNLOCKED, 1 = LOCKED
-
-__device__ /* or host */
-bool try_claim(uint32_t *lock) {
-  return atomicCAS(lock, UNLOCKED, LOCKED) == UNLOCKED;
-}
-
-__device__ /* or host */
-void release(uint32_t *lock) {
-  atomic_thread_fence(memory_order_release);
-  atomicExch(lock, UNLOCKED);
-}
-```
-
-This lock is in fine-grained SVM — both the host and GPU WGs target it
-with `atomicCAS`/`atomicExch`. On the host side these compile to
+This lock is in fine-grained SVM — both the host and GPU WGs target
+it with `atomicCAS`/`atomicExch`. On the host side these compile to
 appropriate `__atomic_compare_exchange` / `__atomic_exchange` builtins
 with PCIe-coherent semantics. Acquire-side memory ordering is on the
 CAS itself; the matching release fence ensures payload writes are
@@ -181,134 +269,106 @@ visible to the next acquirer regardless of which side it's on.
 Whichever side holds the flag has exclusive access to the queue's
 `front` and `back` pointers and to the queue slots that it touches
 during one push or one pop. Neither side spins while holding the lock
-— if the work cannot be completed (host: queue full; GPU: queue empty),
-the lock is released first and the wait happens unlocked (§2.7).
+— if the work cannot be completed (host: queue full; GPU: queue
+empty), the lock is released first and the wait happens unlocked
+(§2.7).
 
-#### 2.2.2 Tile lock (3-state, two bits)
+#### 2.2.2 Per-tile `queue_lock` (binary, brief)
 
-A tile is touched by two kinds of operations with different semantics:
-*queue access* (distributor pushing, renderer draining) and *framebuffer
-access* (renderer rasterizing). Queue access is brief (~μs); framebuffer
-access is long (10K–100K cycles). The two need different mutual-exclusion
-rules:
+`queue_lock` is held only across mutations of `buf[]` and `head`:
 
-- Queue access is mutually exclusive with all other queue access on
-  this tile (single-writer/single-reader on the queue's pointers).
-- Framebuffer access is mutually exclusive with other framebuffer
-  access on this tile (no two renderers on the same tile).
-- Queue access is *not* mutually exclusive with framebuffer access
-  on this tile (distributor pushing while a renderer rasterizes is
-  fine — the new primitives just wait for the next render pass).
+- A distributor holds it for the duration of one bucket append:
+  `was_empty = (head == 0); memcpy(buf + head, bucket, n); head += n`.
+- A renderer holds it for the duration of one drain:
+  `count = head; memcpy(lds, buf, count); head = 0` (and, on the
+  exit path, `atomic_store(&in_ready, 0)`).
 
-A binary lock conflates these. Using a binary lock and "hold through
-rasterize" forces distributors to wait for rasterization to finish.
-Using a binary lock and "release before rasterize" lets a second
-renderer claim the tile and clobber the first renderer's pixel writes.
+Both are bounded by `BUCKET_DEPTH` and `CAP` respectively — a few
+hundred ns. Contention is between distributors targeting the same
+hot tile and the renderer of that same tile; either way the holder
+finishes quickly.
 
-The 3-state design encodes the two concerns in two independent bits:
+#### 2.2.3 Per-tile `render_lock` (binary, long)
 
-```c
-#define TILE_QLOCK    0x1u    // queue access in progress (push or drain)
-#define TILE_RENDER   0x2u    // a renderer owns rasterization
-```
+`render_lock` is held by a renderer for the entire drain-rasterize
+loop on one tile. Hold time is dominated by rasterization (~tens of
+µs). It exists only to enforce **single-renderer-per-tile**: two
+renderers writing the same coarse bin's pixels would race. It is
+explicitly *not* held during `queue_lock` mutations, so a distributor
+can append while a renderer is rasterizing earlier prims.
 
-The four reachable values:
+#### 2.2.4 The `in_ready` flag and the `ready` ring
 
-| Value | Bits  | Meaning                                                  |
-|-------|-------|----------------------------------------------------------|
-| 0x0   | 00    | UNLOCKED — fully idle                                    |
-| 0x1   | 01    | queue access (push or drain), no rasterizer              |
-| 0x2   | 10    | RENDERING (rasterize in progress, queue idle)            |
-| 0x3   | 11    | RENDERING + queue access (push during rasterize)         |
+`in_ready` is a per-tile `uint32_t` with two values:
 
-State transitions, all single CAS or atomic-bit op:
+| Value | Meaning                                                   |
+|-------|-----------------------------------------------------------|
+| 0     | Tile has no pending work and is not in the `ready` ring.  |
+| 1     | Tile is in the `ready` ring **or** a renderer is currently draining/rasterizing it. |
 
-| Operation                      | Transition           |
-|--------------------------------|----------------------|
-| Distributor start push         | `0x0→0x1` or `0x2→0x3` |
-| Distributor end push           | `atomicAnd(~0x1)`    |
-| Renderer start (drain)         | `0x0→0x1` only       |
-| Renderer drain → rasterize     | `0x1→0x2`            |
-| Renderer end rasterize         | `atomicAnd(~0x2)`    |
+Transitions:
 
-The releases use `atomicAnd` (clear-bit) rather than `atomicExch` so
-each side clears only its own bit and preserves the other side's
-ownership. `atomicAnd` is also cheaper on AMDGPU than `atomicExch`
-because it does not need to return a value.
+- Distributor's empty→non-empty push CASes `in_ready` 0→1; on
+  success it pushes the tile ID into the global `ready` ring.
+- Renderer pops a tile ID from `ready` (which conceptually consumes
+  the "in ring" half of the disjunction; `in_ready` stays 1 because
+  the renderer now owns the work).
+- Renderer clears `in_ready` to 0 only when its drain finds
+  `head == 0` — i.e., no new pushes since the previous drain — and
+  it is about to release `render_lock`. The clear happens **inside
+  the same `queue_lock` critical section** as the empty-head observation
+  (§2.5). This is the linearization point that prevents lost wakeups:
+  any distributor that subsequently acquires `queue_lock` will see
+  both `head == 0` and `in_ready == 0`, hence treat its own push as
+  the new empty→non-empty transition and re-publish the tile.
 
-```c
-__device__ bool dist_try_push_lock(uint32_t tile) {
-  // Acquire TILE_QLOCK from UNLOCKED or RENDERING. Two CAS attempts max.
-  if (atomicCAS(&tile_lock[tile], 0x0, 0x1) == 0x0) return true;
-  if (atomicCAS(&tile_lock[tile], 0x2, 0x3) == 0x2) return true;
-  return false;
-}
-
-__device__ void dist_release_push_lock(uint32_t tile) {
-  atomic_thread_fence(memory_order_release);
-  atomicAnd(&tile_lock[tile], ~TILE_QLOCK);
-}
-
-__device__ bool render_try_acquire(uint32_t tile) {
-  // Need fully UNLOCKED; will not start a render pass during another's.
-  return atomicCAS(&tile_lock[tile], 0x0, TILE_QLOCK) == 0x0;
-}
-
-__device__ void render_drain_done(uint32_t tile) {
-  // Drain finished, switch from queue-locked to rendering-only.
-  // CAS form so we never write 0x2 if someone snuck in.
-  atomicCAS(&tile_lock[tile], TILE_QLOCK, TILE_RENDER);
-}
-
-__device__ void render_release(uint32_t tile) {
-  atomic_thread_fence(memory_order_release);
-  atomicAnd(&tile_lock[tile], ~TILE_RENDER);
-}
-```
-
-Distributor cost: at most 2 CAS to acquire + 1 atomicAnd to release.
-Renderer cost: 1 CAS to drain-acquire + 1 CAS to switch + 1 atomicAnd
-to release. The renderer's extra CAS is amortized against the entire
-rasterize phase and is negligible.
-
-**Critical**: none of these acquire calls spin. On failure the WG
-immediately makes another scheduling decision — switch modes, try a
-different tile, or back off briefly. Spinning on a single lock wastes
-the WG's time when alternative work is plentiful.
+The ready ring is a multi-producer multi-consumer ring of `uint32_t`
+tile IDs. `ready.push(T)` appends; `ready.pop(&T)` removes one. Both
+are O(1). Sizing: at most one entry per distinct tile in flight — so
+ring capacity ≥ B suffices (rounded up to the next power of two for
+the slot mask). See §5.5 for memory cost.
 
 **Lock ordering for deadlock freedom**:
 
-- Distributor holds `host_queue_lock` first, then briefly acquires
-  `TILE_QLOCK` on one tile to push, releases it, may then acquire
-  `TILE_QLOCK` on another tile, etc. Never holds queue access on two
-  tiles simultaneously.
-- Renderer holds only the `tile_lock` bits of one tile, never touches
-  `host_queue_lock`. The acquire-drain → switch-to-render sequence
-  uses the same tile's lock without nesting.
+- Distributor holds `host_queue_lock` first (during pop), releases
+  it, then takes per-tile `queue_lock`s one at a time (never two
+  simultaneously). Never holds `render_lock`.
+- Renderer holds `render_lock` for the full pass, plus `queue_lock`
+  briefly inside each drain iteration. The two locks always go in
+  the order `render_lock` → `queue_lock` → release `queue_lock` →
+  (rasterize) → repeat → release `render_lock`. Never the reverse.
 
 The lock-acquisition graph has no cycle. Trivially deadlock-free.
 
-**Memory ordering**: the release fence before `atomicAnd(~TILE_RENDER)`
-publishes the renderer's framebuffer writes to the next renderer that
-acquires this tile. The release fence before `atomicAnd(~TILE_QLOCK)`
-publishes queue updates to the next queue accessor. These are the same
-ordering requirements as a binary lock release — only the bit cleared
-differs.
+**Memory ordering**: a release fence precedes every `release(...)`
+call, so any writes a holder did to `buf[]`, `head`, framebuffer
+pixels, or per-frame ack counters are visible to the next acquirer.
+This is the same plain binary-lock pattern used everywhere else in
+this design.
 
 ### 2.3 Workgroup Loop With Mode Dispatch
 
 The lock-hold window for `host_queue_lock` is kept as small as
 possible — only the actual pop. Bucketing and tile pushes happen
 *after* releasing it, so the host's competing pushes are not blocked
-by the WG's distribution work.
+by the WG's distribution work. Render-mode work discovery is a
+single `ready.pop()` — no scan.
+
+The pseudocode below is the **greedy** mode policy: try distribute
+first every iteration, fall back to render. It is correct and
+readable; the steady-state distributor count self-caps because
+`host_queue_lock` is serializing (only one WG can pop per cycle).
+The recommended production-grade policy biases the per-iteration
+choice on observed queue depths to cut wasted CAS traffic — see
+§3.3. §3 covers all alternatives.
 
 ```c
 uint32_t attempts = 0;                    // §2.8 backoff counter, per-WG SGPR
 for (;;) {
   bool terminating = atomic_load(&terminate);
 
-  // Try distribute mode: pop one batch under host_queue_lock, then
-  // distribute outside the lock. §3 covers alternative mode policies.
+  // Distribute mode: pop one batch under host_queue_lock, then
+  // distribute outside the lock. §3.3 is the recommended mode policy.
   StreamBatch batch;
   bool got_batch = false;
   if (try_claim(&host_queue_lock)) {
@@ -321,10 +381,10 @@ for (;;) {
     continue;
   }
 
-  // Try render mode: pick a tile with pending primitives, claim it.
-  uint32_t tile = pick_tile();            // §4
-  if (tile != NO_TILE && render_try_acquire(tile)) {
-    render(tile);                         // §2.5; releases TILE_RENDER inside
+  // Render mode: pop one tile ID from the global ready ring. O(1).
+  uint32_t T;
+  if (ready.pop(&T)) {
+    render(T);                            // §2.5; handles render_lock contention
     attempts = 0;
     continue;
   }
@@ -343,6 +403,11 @@ typical WG iteration is: CAS-acquire (~50 ns) + pop (~few hundred ns,
 one cache line) + release (~50 ns) ≈ 1 μs of lock hold. That's also
 the maximum window the host has to wait per pop.
 
+`ready.pop` is a single MPMC-ring dequeue — typically one CAS plus a
+relaxed load of the slot. ~50 ns on the success path, comparable on
+the empty path (returns false without spinning). This replaces the
+O(B) `pick_tile()` scan from the previous design (§1.1).
+
 Inside `distribute_batch()` and `render()` the WG uses the standard
 wave-level cooperation pattern: wave 0 performs the queue-touching
 operations (CAS, dequeue head, etc.), writes results into LDS,
@@ -356,27 +421,25 @@ broadcast.
 The distributor processes one batch (already popped under
 `host_queue_lock` per §2.3) per `distribute_batch()` call. It buckets
 primitives by target tile in LDS first (no global atomics), then
-pushes each bucket under that tile's queue-lock bit.
+pushes each bucket under that tile's `queue_lock`.
 
 ```c
 __device__ void distribute_batch(StreamBatch *batch, uint32_t *attempts) {
   // Phase 1: bucket-by-tile in LDS (parallel across waves, no atomics
-  //          on tile queues yet)
-  __shared__ uint32_t lds_bucket_count[B_SUBSET];
-  __shared__ uint32_t lds_bucket_prim[B_SUBSET][BUCKET_DEPTH];
+  //          on tile queues yet).
+  __shared__ uint32_t  lds_bucket_count[B_SUBSET];
+  __shared__ TileEntry lds_bucket_prim [B_SUBSET][BUCKET_DEPTH];
   bucket_by_tile(batch, lds_bucket_count, lds_bucket_prim);
 
-  // Phase 2: push each non-empty bucket under its tile's queue-lock bit
+  // Phase 2: push each non-empty bucket under its tile's queue_lock.
   uint32_t pending = num_active_buckets(lds_bucket_count);
   while (pending > 0) {
     for (uint32_t b = 0; b < B_SUBSET; ++b) {
       if (lds_bucket_count[b] == 0) continue;
-      uint32_t tile = bucket_to_tile(b);
-      if (dist_try_push_lock(tile)) {
-        push_bucket_to_tile_queue(tile,
-                                  lds_bucket_prim[b],
-                                  lds_bucket_count[b]);
-        dist_release_push_lock(tile);
+      uint32_t T = bucket_to_tile(b);
+      if (try_push_to_tile(T,
+                           lds_bucket_prim[b],
+                           lds_bucket_count[b])) {
         lds_bucket_count[b] = 0;
         --pending;
       }
@@ -384,118 +447,177 @@ __device__ void distribute_batch(StreamBatch *batch, uint32_t *attempts) {
     if (pending > 0) wg_backoff(attempts);   // §2.8; retry contended buckets
   }
 }
+
+// Append `n` entries into tile T's primitive buffer; promote T into
+// the ready ring if this is the empty→non-empty transition.
+__device__ bool try_push_to_tile(uint32_t T, const TileEntry *bucket,
+                                 uint32_t n) {
+  if (!try_claim(&tile[T].queue_lock)) return false;
+
+  // §5.4 overflow policy: if head + n > CAP, drop or spill here.
+  bool was_empty = (tile[T].head == 0);
+  memcpy(tile[T].buf + tile[T].head, bucket, n * sizeof(TileEntry));
+  tile[T].head += n;
+  release(&tile[T].queue_lock);
+
+  // Empty→non-empty: promote tile T into the ready ring. CAS prevents
+  // duplicate enqueues when another distributor or a renderer in
+  // its drain-rasterize loop already considers T "in flight".
+  if (was_empty) {
+    if (atomicCAS(&tile[T].in_ready, 0, 1) == 0) {
+      while (!ready.push(T)) wg_backoff(/*ring full*/);
+    }
+  }
+  return true;
+}
 ```
 
 Phases 1 and 2 do not touch `host_queue_lock`. Multiple WGs can be in
 `distribute_batch()` concurrently — each works on its own popped batch
-and pushes to tile queues using per-tile locks (§2.2.2). The only
-serialized point is the pop itself.
+and pushes to tile queues using per-tile `queue_lock`s. The only
+serialized point is the host-queue pop itself.
 
-`dist_try_push_lock` succeeds whenever the tile is UNLOCKED (`0x0`) or
-RENDERING-only (`0x2`). It fails only when another WG is already
-mid-push or mid-drain on this tile — a window of a few μs at most. The
-distributor effectively never waits on rasterization.
+The distributor never waits on rasterization. `queue_lock` is held
+only during the brief append (one `memcpy` + counter update), and
+`render_lock` is independent — a renderer rasterizing the prims it
+already drained does not block our push.
 
 Phase 1 parallelizes across the WG's `W` waves: each wave handles a
-disjoint subset of primitives, AABB-tests each against all bins, writes
-hits into LDS buckets indexed by tile. Bucket-counter updates use LDS
-atomics (~20 cycles), much cheaper than global.
+disjoint subset of primitives, AABB-tests each against all bins,
+writes hits into LDS buckets indexed by tile. Bucket-counter updates
+use LDS atomics (~20 cycles), much cheaper than global.
 
-Phase 2 lock acquisitions per batch: one for the host queue plus one per
-distinct target tile. For a 256-primitive batch hitting ~16 tiles on
-average, that's 17 acquisitions per batch — bounded and predictable.
+Phase 2 lock acquisitions per batch: one for the host queue plus one
+per distinct target tile, plus at most one `in_ready` CAS and one
+`ready.push` per first-touched tile. For a 256-primitive batch
+hitting ~16 tiles on average, that's 17 `queue_lock` acquires plus
+≤ 16 ring pushes — bounded and predictable.
 
-If a tile's queue-lock bit fails (another distributor or a renderer is
-draining it), distributor moves on to other buckets in this round, then
-comes back. Bounded by the longest queue-access window (drain or push) —
-a few μs. Crucially, this is *not* bounded by rasterization time; the
-3-state lock lets a distributor push during rasterize.
+If a tile's `queue_lock` is held (another distributor pushing or the
+renderer of that tile in its brief drain), `try_push_to_tile` returns
+false and the distributor moves on to other buckets in this round,
+then comes back. Bounded by the longest `queue_lock` hold time —
+hundreds of ns.
 
-`B_SUBSET` is the number of tiles the distributor handles per batch. If
-the batch's primitives can hit any of B tiles, bucketing naively
+`B_SUBSET` is the number of tiles the distributor handles per batch.
+If the batch's primitives can hit any of B tiles, bucketing naively
 requires B LDS slots, which scales poorly. Two practical mitigations:
 
-- **LDS hash buckets**: bucket into `B_SUBSET = 64` LDS slots indexed by
-  `tile_id % 64`. Each slot holds a small list of (tile, prims) pairs.
-  Bounded LDS, slight collision handling.
+- **LDS hash buckets**: bucket into `B_SUBSET = 64` LDS slots indexed
+  by `tile_id % 64`. Each slot holds a small list of (tile, prims)
+  pairs. Bounded LDS, slight collision handling.
 - **Per-batch tile set**: precompute the set of tiles the batch's
   primitives can hit (upper bound by primitive AABBs). For typical
-  demo batches (rotating teapot, ~6 K triangles split into batches of
-  256) this is 8–32 distinct tiles per batch.
+  demo batches (rotating teapot, ~6 K triangles split into batches
+  of 256) this is 8–32 distinct tiles per batch.
 
 The second is preferable for moderate batches.
 
 ### 2.5 Render Mode
 
-A render pass on tile `t` proceeds in four phases — three lock
-transitions mapping directly to the 3-state protocol in §2.2.2,
-plus a per-frame ack flush:
+A render pass on tile `T` runs a drain-rasterize loop under
+`render_lock`. Each iteration drains whatever has accumulated since
+the previous one — so prims that distributors push *during*
+rasterization are picked up the next time around without releasing
+`render_lock`. The loop exits exactly when a drain finds the buffer
+empty.
 
-1. Acquire `TILE_QLOCK` on `t` (CAS from `0x0`).
-2. Drain the tile queue into LDS, then transition `TILE_QLOCK → TILE_RENDER`
-   (CAS `0x1 → 0x2`).
-3. Rasterize from LDS while holding only `TILE_RENDER`.
-4. Flush the per-WG frame-ack accumulator (§6.9; full protocol in
-   `frame-completion-detection.md` §5.5), then release
-   `TILE_RENDER` (`atomicAnd(~TILE_RENDER)`).
+The first thing the renderer does after popping `T` from the ready
+ring is try to acquire `render_lock`. If another renderer holds it
+(see §6.2 for when this happens), the work isn't dropped — the tile
+ID is simply re-pushed back into the ready ring and this WG returns
+to the main loop to look for other work.
 
 ```c
-__device__ void render(uint32_t tile) {
-  // Phase 1: acquire the queue lock to safely drain.
-  // Caller already verified render_try_acquire(tile) succeeded.
+__device__ void render(uint32_t T) {
+  // Caller popped T from the ready ring. Try to take render_lock;
+  // re-queue on contention rather than spinning.
+  if (!try_claim(&tile[T].render_lock)) {
+    while (!ready.push(T)) wg_backoff(/*ring full*/);
+    return;
+  }
 
-  __shared__ uint32_t lds_prim_count;
-  __shared__ uint32_t lds_prim_indices[MAX_TILE_PRIMS];
-  __shared__ uint16_t lds_prim_frame_id[MAX_TILE_PRIMS];   // see §6.9
-  drain_tile_queue(tile, lds_prim_indices,
-                   lds_prim_frame_id, &lds_prim_count);
+  __shared__ uint32_t  lds_count;
+  __shared__ TileEntry lds_prim[CAP];          // packs prim_id + frame_id
+  __shared__ uint16_t  lds_prim_frame_id[CAP]; // see §6.9
 
-  // Phase 2: switch to RENDERING-only. Distributors may now push to
-  // this tile's queue concurrently with the rasterize below.
-  render_drain_done(tile);
+  for (;;) {
+    // Drain phase: brief queue_lock hold.
+    while (!try_claim(&tile[T].queue_lock)) wg_backoff(/*queue contended*/);
 
-  // Phase 3: rasterize from LDS. New pushes accumulate in the tile
-  // queue and are rendered by the next claim of this tile.
-  rasterize_tile(tile, lds_prim_indices, lds_prim_count);
+    uint32_t count = tile[T].head;
+    if (count > 0) {
+      drain_to_lds(tile[T].buf, count,
+                   lds_prim, lds_prim_frame_id);
+      tile[T].head = 0;
+    } else {
+      // Empty drain: nothing arrived since the previous rasterize.
+      // Open the ready-gate inside queue_lock so the next distributor
+      // push observes (head==0, in_ready==0) and re-queues T.
+      atomic_store(&tile[T].in_ready, 0);
+    }
+    release(&tile[T].queue_lock);
 
-  // Phase 4: ack the rasterized primitives to their frame counters,
-  // then release the rendering bit. ack_drain accumulates per-frame
-  // counts in SGPRs and folds them into the appropriate
-  // frame_ack[FRAME_SLOT(F)].rendered entries (see
-  // frame-completion-detection.md §5.5 for the body, §5.6 for the
-  // forced-flush corner case, and §6.9 here for integration).
-  ack_drain(lds_prim_frame_id, lds_prim_count);
+    if (count == 0) break;
 
-  // atomicAnd preserves a concurrent distributor's TILE_QLOCK bit
-  // if any.
-  render_release(tile);
+    // Rasterize from LDS. queue_lock is free — distributors may push
+    // more prims for T concurrently; we'll see them next iteration.
+    rasterize_tile(T, lds_prim, count);
+
+    // §6.9 frame-ack flush; full protocol in
+    // `frame-completion-detection.md` §5.5.
+    ack_drain(lds_prim_frame_id, count);
+  }
+
+  release(&tile[T].render_lock);
 }
 ```
 
-While this WG is in phase 3, the tile state is `0x2` (or `0x3` if a
-distributor has the queue lock). Other renderers see neither `0x0`
-nor `0x1` and so cannot start a fresh render pass on this tile —
-preventing the framebuffer race that would happen if both rasterized
-into `t`'s pixels at once. Distributors see "not queue-locked" in the
-`0x2` state and can acquire the queue-lock bit to push, raising the
-state to `0x3` briefly, then back to `0x2`.
+**Linearization of the empty-drain exit.** This is the only subtle
+part. The `atomic_store(&in_ready, 0)` is done *inside* the
+`queue_lock` critical section that observed `head == 0`. Any
+distributor that subsequently acquires `queue_lock` therefore sees
+both `head == 0` (`was_empty == true`) and `in_ready == 0`, so its
+own append is the new empty→non-empty transition: it CASes
+`in_ready` 0→1 and re-publishes T into the ready ring. No wakeup is
+lost.
 
-The blocking timing is asymmetric and that's the whole point:
+Conversely, a distributor whose push *raced* the renderer's last
+drain — i.e., it acquired `queue_lock` before the renderer's
+last-iteration acquire — leaves `head > 0`. The renderer's drain
+then sees `count > 0`, takes the prims, rasterizes, and loops again.
+No prim is missed.
 
-- Distributor blocked on this tile: only during another WG's drain or
-  another distributor's push (~μs).
-- Other renderer blocked on this tile: through this renderer's entire
-  phase (drain + rasterize ≈ 50 μs).
-- This renderer blocked on its own tile: only during another
-  distributor's concurrent push (~μs, and only at queue-pointer
-  manipulation; the LDS-resident primitive list is unaffected).
+The `try_claim`/`re-queue` path on `render_lock` is reachable only
+in a narrow window: between a previous renderer clearing
+`in_ready = 0` (still inside its `queue_lock` critical section) and
+its `release(render_lock)`. A distributor that pushes inside that
+window CASes `in_ready` 0→1 and pushes T to ready; another renderer
+can pop T before the previous one releases `render_lock`. The
+re-push keeps the work alive without spinning.
 
-New primitives pushed during a render pass are rendered in the *next*
-claim of this tile. For opaque "first closer wins" depth this is
-correct (the depth test handles ordering). For blended draws or
-alpha-test, the across-pass ordering needs to match the host's submit
-order — same caveat that applies to any tile that is rendered more
-than once per frame.
+The blocking timing is asymmetric, which is the point of having
+two independent locks rather than one:
+
+- **Distributor blocked on this tile**: only during another WG's
+  drain or another distributor's push (a few hundred ns of
+  `queue_lock` hold).
+- **Other renderer blocked on this tile**: through this renderer's
+  entire pass (`render_lock` held for tens of µs). The other
+  renderer doesn't actually wait — it re-pushes the tile to ready
+  and returns.
+- **This renderer blocked on its own tile**: only during another
+  distributor's concurrent push (a few hundred ns of `queue_lock`),
+  and only at the start of each drain iteration. The rasterize
+  phase holds no `queue_lock`.
+
+New primitives pushed during a render pass are picked up by **this
+renderer's next loop iteration** (not the next claim of T) — no
+release/re-acquire of `render_lock` between drains. For opaque
+"first closer wins" depth this is correct (the depth test handles
+ordering). For blended draws or alpha-test, ordering across drain
+iterations needs to match the host's submit order; the per-tile
+buffer is FIFO by append order, and `drain_to_lds` preserves that.
 
 `rasterize_tile` subdivides the coarse bin into `W` fine sub-tiles
 (one per wave) and lets each wave rasterize its assigned sub-tile.
@@ -543,9 +665,9 @@ wave is 4 plus ~1 retry on collision. Total ~100 cycles of LDS atomic
 per wave per coarse bin — negligible against rasterization work.
 
 **No inter-wave atomics on the framebuffer**: each wave writes to its
-claimed sub-tile exclusively, the same property as the streaming
-proposal's static wave-per-fine-tile assignment, but with dynamic load
-balance.
+claimed sub-tile exclusively. A static one-wave-per-fine-tile
+assignment has the same property; dynamic claiming preserves it
+while improving load balance when wave runtimes diverge.
 
 #### 2.6.1 Per-Pixel Work: Demo Shader
 
@@ -698,10 +820,12 @@ queue-full into work-stealing-style producer-side distribution.
 ### 2.8 GPU-Side Backoff
 
 Several places in the WG loop need to back off when work is
-unavailable: phase-2 retry on contended `tile_lock` in
-`distribute_batch` (§2.4), `pick_tile()` returning `NO_TILE` (§2.3),
-and the case where both `host_queue_lock` and a `tile_lock` cannot be
-claimed in the same iteration. The right primitive on AMDGPU is
+unavailable: phase-2 retry on a contended `queue_lock` in
+`distribute_batch` (§2.4), `ready.pop()` returning false in §2.3,
+the renderer's drain-time `queue_lock` retry in §2.5, the host-queue
+push retry on a full `ready` ring in §2.4, and the case where neither
+mode finds work in one iteration of the main loop. The right
+primitive on AMDGPU is
 **`s_sleep`**, exposed by clang as `__builtin_amdgcn_s_sleep(simm16)`.
 
 #### What s_sleep does
@@ -837,11 +961,36 @@ productive iterations.
 
 ## 3. Mode Selection Strategy
 
-The "try pop first, fall back to render" pattern in §2.3 is the
-baseline. The `host_queue_lock` is held only across the pop (~1 μs);
-multiple WGs can be in `distribute_batch` concurrently after popping,
-each operating on a different batch. Mode rotation happens naturally
-as WGs and the host alternate as lock holders.
+Each WG decides per iteration whether to attempt distribute or render.
+The §2.3 pattern is the simplest correct version — try the host
+queue, fall back to render. The interesting question is *how the
+distributor:renderer ratio settles*, given that there is no fixed
+WG partition.
+
+The answer is **back-pressure self-balancing**: both queues carry
+depth signals that automatically push the system toward the right
+ratio. There is no `N_dist` / `N_rend` configuration parameter, no
+dependence on the WG count `N`, and no cost-model retuning per
+resolution or framerate.
+
+- Too few distributors → host queue fills (`h` rises) → the host's
+  own backoff (§2.7) kicks in *and* WGs that observe `h > 0` shift
+  toward distribute.
+- Too many distributors → ready ring fills (`r` rises) → distributors
+  produce slower (push to a back-pressured ring) *and* WGs that
+  observe `r > 0` shift toward render.
+
+The §3.1 / §3.2 variants are primitives that operate on this signal
+implicitly (CAS serialization on `host_queue_lock` already caps the
+rate at which distribute mode runs). §3.3 makes the bias explicit
+and is the canonical baseline. §3.5 / §3.6 are escape hatches that
+override the dynamic balance with a fixed split — useful as
+diagnostic tools, not as a normal operating mode.
+
+The `host_queue_lock` is held only across the pop (~1 μs); multiple
+WGs can be in `distribute_batch` concurrently after popping, each
+operating on a different batch. Mode rotation happens naturally as
+WGs and the host alternate as lock holders.
 
 ### 3.1 Greedy Pop-Then-Distribute (Baseline)
 
@@ -851,8 +1000,12 @@ if (try_claim(&host_queue_lock)) {
   got = pop_host_queue(&batch);
   release(&host_queue_lock);
 }
-if (got) distribute_batch(&batch, &attempts);   // §2.4
-else     render(...);
+if (got) {
+  distribute_batch(&batch, &attempts);   // §2.4
+} else {
+  uint32_t T;
+  if (ready.pop(&T)) render(T);          // §2.5
+}
 ```
 
 The WG always tries to pop. If the queue is empty or the lock is held
@@ -872,22 +1025,144 @@ if (depth > 0 && try_claim(&host_queue_lock)) {
   got = pop_host_queue(&batch);
   release(&host_queue_lock);
 }
-if (got) distribute_batch(&batch, &attempts);   // §2.4
-else     render(...);
+if (got) {
+  distribute_batch(&batch, &attempts);   // §2.4
+} else {
+  uint32_t T;
+  if (ready.pop(&T)) render(T);          // §2.5
+}
 ```
 
 Particularly useful when the host produces in bursts with idle gaps
 between them.
 
-### 3.3 Rotating Pop
+### 3.3 Queue-Depth-Biased Mode Selection (Recommended)
+
+§3.1 has every free WG attempt the `host_queue_lock` CAS each
+iteration even though only one can win. With `N ≈ 80` WGs hammering
+a fine-grained-SVM lock that costs ~500 ns – 1 μs per CAS round-trip,
+the losing WGs spend most of their time generating cache traffic
+instead of doing work. §3.2 cuts this when the host is fully idle
+(`h == 0`); when `h > 0` the storm returns.
+
+The fix is to bias each WG's choice of mode using **observed queue
+depths** read with relaxed atomics: the host queue depth `h` and the
+ready ring depth `r`. The bias adapts itself; the only state per WG
+is one SGPR for an xorshift seed.
+
+```c
+uint32_t h = host_queue_back - host_queue_front;   // relaxed
+uint32_t r = ready.depth_relaxed();                // relaxed
+
+// Probability of attempting distribute first this iteration:
+//   p_distribute = h / (h + r + 1)
+uint32_t denom = h + r + 1;
+bool try_distribute_first = (rng_next(&wg_seed) % denom) < h;
+
+if (try_distribute_first) {
+  StreamBatch batch; bool got = false;
+  if (try_claim(&host_queue_lock)) {
+    got = pop_host_queue(&batch);
+    release(&host_queue_lock);
+  }
+  if (got) {
+    distribute_batch(&batch, &attempts);
+    attempts = 0; continue;          // §2.3 productive-work reset
+  }
+
+  // CAS-fail or empty queue. Render this iteration so we don't spin.
+  uint32_t T;
+  if (ready.pop(&T)) { render(T); attempts = 0; continue; }
+} else {
+  uint32_t T;
+  if (ready.pop(&T)) { render(T); attempts = 0; continue; }
+
+  // Ready ring empty. Try distribute as fallback so the WG doesn't idle.
+  StreamBatch batch; bool got = false;
+  if (try_claim(&host_queue_lock)) {
+    got = pop_host_queue(&batch);
+    release(&host_queue_lock);
+  }
+  if (got) {
+    distribute_batch(&batch, &attempts);
+    attempts = 0; continue;
+  }
+}
+// Nothing on either side. Fall through to §2.3's terminate / backoff.
+```
+
+Behaviour at the corners:
+
+- **`h = 0`** (host idle): `p_distribute = 0`, every WG renders. No
+  CAS pressure on the SVM lock — important because that lock is the
+  most expensive atomic in the system.
+- **`r = 0`** (no rasterizable tiles): `p_distribute = 1`, every WG
+  attempts distribute. Bootstraps the system from an empty state
+  (e.g. start-of-frame).
+- **Steady state**: `h` and `r` track the production/consumption
+  imbalance. If renderers fall behind, `r` rises → fewer
+  distributors → the imbalance corrects. If distributors fall behind,
+  `h` rises → more distributors → ditto. The fixed point sits where
+  ready entries are produced and consumed at matching rates.
+
+Per-iteration cost on top of §2.3 is two relaxed loads (~50 ns total)
+plus one xorshift32 step plus a 32-bit mod. The xorshift state is
+seeded once at WG launch (any non-zero value; xorshift32 has a fixed
+point at 0):
+
+```c
+__device__ uint32_t rng_next(uint32_t *s) {
+  uint32_t x = *s;
+  x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+  *s = x;
+  return x;
+}
+
+// At WG launch, lane 0 of wave 0 initialises the per-WG seed:
+uint32_t wg_seed = (wg_id * 0x9E3779B9u) | 1u;   // golden ratio, force non-zero
+```
+
+The relaxed depth reads can lag the true value by tens of nanoseconds
+and may be off by O(N) WGs in flight; that's fine. This is a
+heuristic, and the per-branch fallbacks cover any wrong guess at zero
+correctness cost. `ready.depth_relaxed()` is the unsigned difference
+of the ring's modular head/tail counters (saturated to 0 if torn).
+
+### 3.4 α-Bias Variant
+
+If profiling shows the natural ratio under §3.3 is wrong (e.g.
+distribute-side is the bottleneck or, conversely, the ready ring
+drowns everything), tune with a single integer multiplier `α`:
+
+```c
+//   p_distribute = (W_H · h) / (W_H · h + W_R · r + 1)
+uint32_t num = W_H * h;
+uint32_t den = W_R * r + 1;
+bool try_distribute_first = (rng_next(&wg_seed) % (num + den)) < num;
+```
+
+- `W_H == W_R == 1`: §3.3 default.
+- `W_H > W_R`: prefer distribute — use when host queue tends to back
+  up under load (large batches, slow `distribute_batch`).
+- `W_R > W_H`: prefer render — use when distribute is cheap relative
+  to render and the ready ring fills quickly (small batches, fat
+  primitives).
+
+`W_H` / `W_R` are global constants, independent of `N`, `B`,
+resolution, or framerate. Treat them as profiling knobs, not as
+configuration parameters; the §3.3 default should work for the
+demo workload.
+
+### 3.5 Rotating Pop
 
 After a WG finishes a `distribute_batch()`, it skips the host queue
 claim on the next iteration (sets a per-WG flag). Rotates the
 distributor identity across WGs to spread the LDS bucketing cost.
 Useful only if distribute mode imposes meaningful per-WG overhead
-beyond the work itself; usually unnecessary.
+beyond the work itself; usually unnecessary, and §3.3 already
+spreads the role across WGs probabilistically.
 
-### 3.4 Reserved-Distributor Pool
+### 3.6 Reserved-Distributor Pool
 
 Dedicate a subset of WGs (e.g., `wg_id % K == 0`) to distribute only;
 others to render only. Re-introduces a soft role split as a tuning
@@ -897,80 +1172,97 @@ WGs) since distribution is light per batch.
 Defeats the point of dynamic role selection, but useful as a
 diagnostic tool: if a fixed split outperforms the dynamic one,
 profiling will quickly show which side (distribute or render) is
-bottlenecking.
+bottlenecking. Once identified, prefer raising `W_H` / `W_R` (§3.4)
+to keep the back-pressure feedback loop intact.
 
-### 3.5 Recommendation
+### 3.7 Recommendation
 
-Greedy distribute as baseline. Move to demand-based if the host queue is
-often empty and CAS contention shows up in profiling.
+§3.3 is the canonical baseline. §3.1 and §3.2 are the primitives it
+falls back to inside each branch — keep them in the kernel for the
+fallback paths but do not use them as the top-level mode pick.
+
+If profiling shows persistent imbalance under §3.3, try §3.4
+(`α`-bias) before reaching for §3.5 (rotating pop) or §3.6
+(reserved-distributor pool); the latter two override the back-pressure
+self-tuning property and should be a last resort.
 
 ## 4. Tile Selection Strategy
 
-When a WG decides to render, it picks which tile to claim. With B tiles
-and `B >> N`, simple strategies suffice.
+Renderers don't pick a tile — they consume a tile ID from the global
+`ready` ring. The full strategy is a single `ready.pop(&T)` on the
+hot path, plus a re-push on `render_lock` contention.
 
-### 4.1 Stride-Offset Linear Scan (Recommended Baseline)
+### 4.1 Ready-Ring Pop (Baseline)
 
 ```c
-__device__ uint32_t pick_tile() {
-  uint32_t start = (wg_id * 2654435761u) % B;   // Knuth multiplicative hash
-  for (uint32_t off = 0; off < B; ++off) {
-    uint32_t tile = (start + off) % B;
-    // Renderer needs fully-UNLOCKED state (0x0); reject anything else.
-    if (atomic_load_relaxed(&tile_lock[tile]) == 0x0 &&
-        atomic_load_relaxed(&tile_pending[tile]) > 0) {
-      return tile;            // candidate; render_try_acquire still races
-    }
-  }
-  return NO_TILE;
-}
+uint32_t T;
+if (ready.pop(&T)) render(T);   // §2.5
 ```
 
-The hash gives each WG a different starting offset; initial claims are
-spread across the tile space. With `B/N > 16` the first slot examined
-is almost always free. The relaxed loads before the CAS are hints only
-— actual ownership is decided by `render_try_acquire`'s CAS (§2.2.2).
+- **Cost**: one MPMC-ring pop per pick, ~50 ns. No tile-by-tile
+  probing.
+- **Selection policy**: FIFO by enqueue time (= empty→non-empty
+  transition). The host's stream order maps directly to render
+  order, modulo the inevitable interleavings from concurrent
+  distributors.
+- **Wakeup latency**: bounded by the time between distributor's
+  `ready.push(T)` and any free renderer's `ready.pop`. With B/N ≥ 16
+  every renderer tends to find work on the first pop.
 
-`tile_pending[tile]` is a coarse counter incremented when distributor
-pushes to a tile and decremented when renderer drains. Skipping empty
-tiles avoids claiming a lock just to find no work.
+The `in_ready` flag in the per-tile state coalesces enqueues so the
+ring never carries duplicate T entries, even under heavy pushing
+(§2.2.4). The renderer's re-push on `render_lock` contention is the
+only way an entry transiently re-enters the ring; that path is
+self-limiting since the holding renderer eventually exits.
 
-Expected cost: 2 loads + 1 CAS per pick on success. ~80 ns total.
+### 4.2 Variants (Optional, Profile First)
 
-### 4.2 Workload-Aware
+The ring is FIFO and ignores spatial layout. Two refinements are
+plausible if profiling shows headroom:
 
-Use `tile_pending[tile]` to scan for the highest-workload free tile.
-Better load balance, costs an extra atomic per push. Use only when
-profiling shows naive picking causes imbalance.
+- **Two-stage ring with locality bias**. Use one MPMC ring per
+  Morton-octant of the screen; renderers prefer their home octant's
+  ring before stealing from neighbours. Trades some imbalance for
+  texture/lightmap cache reuse. Adds B-bit-counted per-octant
+  state.
+- **Workload-weighted ordering**. Have distributors push the tile
+  ID *plus* a backlog hint; renderers preferentially pop the
+  highest-backlog entry. Requires a priority-queue-style ring,
+  which is more expensive than the plain MPMC ring on the hot
+  path.
 
-### 4.3 Two-Phase Home + Steal
+Neither is needed for the demo workload (§1) — stick with the
+single FIFO ring as the baseline and add a variant only if a
+profiled bottleneck calls for it.
 
-Each WG has a home range `[wg_id × B/N, (wg_id+1) × B/N)`. Tries home
-first, falls back to global stride-offset scan if all home tiles are
-locked or empty.
+### 4.3 Why Not A Per-Tile Scan?
 
-Trades some load balance for spatial locality: home tiles are spatially
-close, so texture/lightmap caches stay hot across iterations on the
-same WG.
+The earlier revision of this document proposed a stride-offset linear
+scan over `tile_lock[]` (`pick_tile()`). We tried it and found
+(§1.1):
 
-### 4.4 Z-Order Locality
+- The scan walks all B tiles per pick on sparse frames (most tiles
+  empty), eating ~100 ns per probed tile. At 1080p / 32×32 with
+  B ≈ 2 040 the scan dominated renderer wakeup latency.
+- Stride-offset hashing helps only on the *first* probe; subsequent
+  probes still walk through empty tiles.
+- The two relaxed loads per probe (lock state and pending count)
+  invalidate cache lines as distributors push, so even an empty
+  scan generates write-back traffic.
 
-Map `tile_id` to a Morton-coded spatial position. Home ranges in
-Z-order ensure adjacent tiles share texture cache lines. Significant
-memory-bandwidth win on big scenes; complicates tile-id arithmetic.
-
-### 4.5 Recommendation
-
-Stride-offset linear scan with `tile_pending` skip as baseline. Add
-workload-aware (4.2) only if profiling shows imbalance. Add Z-order
-(4.4) if memory bandwidth becomes the bottleneck.
+The ready ring removes the scan entirely and the per-tile
+`tile_pending` counter becomes redundant — the empty-vs-non-empty
+question is now answered by `head` inside `queue_lock`, and the
+"is it queued for rendering" question is answered by `in_ready` /
+the ring contents.
 
 ## 5. Memory Footprint
 
 The pipeline's global memory cost is dominated by **per-tile queue state**.
 Everything else is fixed-overhead or scales with primitive count rather
-than tile count. Numbers below are at a 32-bit `tile_lock` and a 32-bit
-primitive-id queue entry; see §5.3 for sizing the queue capacity `C`.
+than tile count. Numbers below assume the per-tile header laid out in
+§5.1 (three 4-byte locks/flags + `head`) and a 4-byte `TileEntry` per
+queue slot; see §5.3 for sizing the queue capacity `C`.
 
 **Units.** All sizes in this section use **MiB = 2²⁰ B** unless
 explicitly stated otherwise (e.g. `50 K × 96 B = 4.8 MB` in §5.5
@@ -979,25 +1271,32 @@ converts to ≈ 4.6 MiB).
 
 ### 5.1 Per-Tile State
 
-Each coarse tile carries a fixed-size record:
+Each coarse tile carries a fixed-size `Tile` record (§2.2):
 
 | Field | Bytes | Where it lives |
 |---|---|---|
-| `tile_lock[i]` (3-state, §2.2.2) | 4 | VRAM |
-| `tile_pending[i]` (depth hint) | 4 | VRAM |
-| `tile_queue.head` | 4 | VRAM |
-| `tile_queue.tail` | 4 | VRAM |
-| `tile_queue.data[C]` (uint32 prim ids) | 4·C | VRAM |
+| `tile[i].queue_lock` (binary, §2.2.2) | 4 | VRAM |
+| `tile[i].render_lock` (binary, §2.2.3) | 4 | VRAM |
+| `tile[i].in_ready` (1 bit, padded, §2.2.4) | 4 | VRAM |
+| `tile[i].head` (current count) | 4 | VRAM |
+| `tile[i].buf[C]` (packed prim_id + frame_id) | 4·C | VRAM |
 | **Total** | **16 + 4·C** | VRAM |
 
-Each queue entry is a `uint32_t` primitive index; actual primitive
-screen-space data lives once in the streaming primitive store (§5.5),
-not duplicated per tile.
+Each `TileEntry` is a `uint32_t` packing the 16-bit primitive index
+and 16-bit frame id (used by `ack_drain` in §6.9 for frame-completion
+detection). Actual per-primitive screen-space data lives once in the
+streaming primitive store (§5.5), not duplicated per tile.
 
-The tile arrays live in **device-local VRAM**, not fine-grained SVM:
-only GPU WGs touch them, the host never reads or writes. PCIe-coherent
+The buffer is treated as a stack: distributors append at `head`, the
+renderer drains the entire prefix `[0, head)` in one shot. This drops
+the FIFO `tail` pointer that the previous design used.
+
+The tile array lives in **device-local VRAM**, not fine-grained SVM:
+only GPU WGs touch it, the host never reads or writes. PCIe-coherent
 SVM is reserved for the host queue, the `terminate` flag, and the
-heartbeat counter (§5.5).
+heartbeat counter (§5.5). The total per-tile cost is unchanged from
+the previous (3-state-lock) revision — the four header words just
+play different roles now.
 
 ### 5.2 Total Tile-State Memory
 
@@ -1033,12 +1332,14 @@ Queue capacity needs to absorb the largest plausible burst between
 drains. Three regimes to consider:
 
 - **Per-push burst.** Distribute mode pushes one LDS bucket per
-  `TILE_QLOCK` acquire. Bucket cap is `BUCKET_DEPTH` (typical 32–64
+  `queue_lock` acquire. Bucket cap is `BUCKET_DEPTH` (typical 32–64
   prims). One push can never exceed this.
-- **Multi-push between drains.** While a tile is in `TILE_RENDER`
-  (rasterizing, ~50 μs), distributors can push concurrently. With one
-  active distributor and ~10 μs per push, that's ≤5 pushes ≤320 prims
-  per tile during a single render pass.
+- **Multi-push between drains.** While a tile's `render_lock` is
+  held by a renderer mid-rasterize (~50 μs), distributors can push
+  concurrently — `queue_lock` is independent of `render_lock`. With
+  one active distributor and ~10 μs per push, that's ≤5 pushes
+  ≤320 prims per tile during a single render pass. The renderer's
+  next drain iteration absorbs them.
 - **Aggregate hot-tile load.** For demo-shape (P ≈ 6 K triangles per
   frame, f ≈ 4 tile hits per prim), uniform distribution yields
   `f·P/B ≈ 12` prims per tile per frame at 1080p 32×32. Foreground
@@ -1088,6 +1389,7 @@ Independent of `B` and `C`, but required by the pipeline:
 | `terminate` flag | 4 B | fine SVM |
 | Heartbeat counter | 4 B | fine SVM |
 | `frame_ack[NUM_INFLIGHT_FRAMES]` (§6.9) | 4 × 16 B = 64 B | fine SVM |
+| `ready` ring (slots + head/tail + lock) | next_pow2(B) × 4 B + ~64 B | VRAM |
 | Coarse depth (HiZ, optional) | B × 8 B | VRAM |
 | Framebuffer (color + depth) | W·H · 8 B | VRAM |
 | LDS scratch (per WG) | ~16 KiB / WG | LDS (on-chip) |
@@ -1115,35 +1417,55 @@ If a hierarchical-Z extension is added (per-tile `(min, max)` depth
 in VRAM, used to skip primitives that fail the tile-Z test before
 binning), the per-tile `B × 8 B` is negligible (~64 KiB at 4K 32×32).
 
+The **`ready` ring** sizing follows from the in_ready coalescing
+invariant: at most one entry per tile can be in the ring at any
+time, so `ring_capacity ≥ B` suffices. Round up to the next power
+of two for the slot mask:
+
+| Resolution | Tile | B | Ring capacity | Memory |
+|---|---|---|---|---|
+| 1080p | 32 | 2 040 | 2 048 | 8 KiB |
+| 1080p | 64 | 510   | 512   | 2 KiB |
+| 1440p | 32 | 3 600 | 4 096 | 16 KiB |
+| 4K    | 32 | 8 160 | 8 192 | 32 KiB |
+| 4K    | 64 | 2 040 | 2 048 | 8 KiB |
+
+Plus a small fixed header (head, tail, lock, padding) of ~64 B. The
+ring stays below **32 KiB** even at 4K / 32×32, which is negligible
+against the framebuffer's tens of MiB.
+
 ### 5.6 Total Pipeline Footprint
 
 Sum at the recommended **C=256** default. Framebuffer column is
-`W·H · 8 B` (color + depth) expressed in MiB:
+`W·H · 8 B` (color + depth) expressed in MiB. The ready ring
+(≤ 32 KiB at 4K) is rolled into the tile-state column.
 
-| Resolution | Tile | Tile state | Other (fine SVM) | Other (VRAM, FB) | Total |
+| Resolution | Tile | Tile state + ring | Other (fine SVM) | Other (VRAM, FB) | Total |
 |---|---|---|---|---|---|
-| 1080p | 32 | 2.02 MiB | ~5 MiB | 15.8 MiB | ~23 MiB |
-| 1440p | 32 | 3.57 MiB | ~5 MiB | 28.1 MiB | ~37 MiB |
-| 4K | 32 | 8.09 MiB | ~5 MiB | 63.3 MiB | ~76 MiB |
-| 4K | 64 | 2.02 MiB | ~5 MiB | 63.3 MiB | ~70 MiB |
+| 1080p | 32 | 2.03 MiB | ~5 MiB | 15.8 MiB | ~23 MiB |
+| 1440p | 32 | 3.59 MiB | ~5 MiB | 28.1 MiB | ~37 MiB |
+| 4K | 32 | 8.12 MiB | ~5 MiB | 63.3 MiB | ~76 MiB |
+| 4K | 64 | 2.03 MiB | ~5 MiB | 63.3 MiB | ~70 MiB |
 
 The framebuffer dominates at high resolutions; tile state is a small
-contribution. The `B/N ≥ 16` recommendation in §1 (favoring smaller
-tiles for fewer renderer-claim collisions, §6.2) costs only a few
-MiB of extra VRAM — there is no memory pressure to push toward
-larger tiles.
+contribution and the ready ring is a rounding error on top of it.
+The `B/N ≥ 16` recommendation in §1 (favoring smaller tiles for
+fewer renderer contention events, §6.2) costs only a few MiB of
+extra VRAM — there is no memory pressure to push toward larger
+tiles.
 
 ## 6. Open Issues
 
 ### 6.1 Distributor Push Contention On Hot Tiles (Severity: low)
 
-The 3-state lock decouples push from rasterize, so distributors are
-*not* blocked on rasterization. They only contend with another
-distributor pushing to the same tile or a renderer in its drain phase
-— both ~μs windows. With `B >> N` and per-batch bucket scattering,
-contention is rare; with hot-tile workloads (many primitives target
-the same coarse bin), distributor's phase-2 retry loop may revisit the
-same bucket several times.
+`queue_lock` is independent of `render_lock` (§2.2), so distributors
+are *not* blocked on rasterization. They only contend with another
+distributor pushing to the same tile or with a renderer's brief drain
+of that same tile — both windows of a few hundred ns. With `B >> N`
+and per-batch bucket scattering, contention is rare; with hot-tile
+workloads (many primitives target the same coarse bin), the
+distributor's phase-2 retry loop may revisit the same bucket several
+times in close succession.
 
 Mitigations if profiling shows this matters:
 
@@ -1151,20 +1473,27 @@ Mitigations if profiling shows this matters:
   different shards in parallel.
 - Larger `B` — finer bins reduce per-bin push frequency.
 
-### 6.2 Renderer Claim Contention (Severity: medium)
+### 6.2 Renderer Lock Contention (Severity: low)
 
-Other WGs that want to render a tile already in `TILE_RENDER` state
-fail their CAS (`render_try_acquire` requires fully UNLOCKED) and pick
-a different tile. With `B >> N` they find one within 1–2 picks. With
-`B/N < 4`, the failure rate climbs; many WGs may scan multiple tiles
-before finding one in state `0x0`.
+A renderer that pops `T` from the ready ring fails to acquire
+`render_lock` only if another renderer is mid-pass on `T`. The
+window is narrow (§2.5 "Linearization of the empty-drain exit"):
+between a previous renderer's `atomic_store(&in_ready, 0)` inside
+`queue_lock` and its `release(render_lock)`, a distributor push can
+re-publish `T` and another renderer can pop it before the first
+finishes. The losing renderer simply re-pushes `T` into the ready
+ring and goes back to the main loop — no spinning, no scan, no work
+lost.
 
-This is the binding constraint on the bin-ownership design's lower
-bound for `B/N`. Rasterization time (10K–100K cycles) dominates
-TILE_RENDER hold time, so the population of "free" tiles cycles slowly.
+Compared to the previous design's `render_try_acquire` failures —
+which rejected the tile *and required scanning for another* — this
+costs only one ring push and one main-loop iteration before the WG
+is productive again. Severity drops accordingly.
 
-Mitigation: keep `B/N` large by sizing coarse bins small. Profile
-`render_try_acquire` failure rate; if > 5%, increase B.
+Mitigation: keep `B/N` large enough that the ring usually has
+multiple distinct entries when a re-push lands. Profile re-push
+rate (a debug counter on the `try_claim(&render_lock)` failure
+path); if > 5% of `render()` invocations re-push, increase B.
 
 ### 6.3 Distributor Starvation (Severity: low)
 
@@ -1182,30 +1511,35 @@ Concrete failure modes:
   depth and how often the host crosses into tier 2/3 of the backoff.
 - **Bursty contention.** Many WGs hammering the lock at once causes
   CAS misses; only one wins per cycle. Demand-based pop (§3.2) helps
-  by skipping the CAS when `back == front`.
+  by skipping the CAS when `back == front`; the queue-depth-biased
+  policy (§3.3) extends this to skip the CAS *probabilistically*
+  whenever the ready ring is non-trivially full, which addresses the
+  expensive-CAS storm on fine-grained-SVM atomics.
 
 Crossing into tier 3 (sleep) regularly is the symptom that even with
 parallel distribute the GPU consumer cannot keep up — typically
 because individual `distribute_batch` calls are slow (large batches,
 hot tiles). Mitigations: sharded host queues (§6.7), larger batch
-size (fewer push round-trips per primitive), or fall back to a
-fixed-role distributor pool (§3.4) if the bottleneck is consistent.
+size (fewer push round-trips per primitive), or — as a diagnostic —
+fall back to a fixed-role distributor pool (§3.6) to confirm the
+bottleneck is consistent.
 
 ### 6.4 Deadlock Avoidance (Severity: low)
 
-Lock ordering rule (§2.2): distributor holds host_queue_lock then at
-most one tile_lock; renderer holds only tile_lock; no cycles. Trivially
-deadlock-free.
+Lock ordering rule (§2.2): distributor holds `host_queue_lock` then
+at most one `queue_lock`; renderer holds `render_lock` then at most
+one `queue_lock`; no cycles. The ready ring is lock-free w.r.t. the
+tile locks. Trivially deadlock-free.
 
 ### 6.5 Choosing B (Severity: high)
 
 `B` is the central tuning parameter:
 
-- Too small: renderers cannot find UNLOCKED tiles; `render_try_acquire`
-  CAS-failure rate climbs; effective parallelism collapses (§6.2).
+- Too small: renderer re-push rate climbs as multiple WGs race for
+  the same tile (§6.2); effective parallelism degrades.
 - Too large: per-pixel overhead from finer bin granularity, tile-state
-  cache pressure, more queue traffic, larger `tile_lock[]` array (see
-  §5.2 for footprint at each B).
+  cache pressure, more queue traffic, larger `tile[]` array (see §5.2
+  for footprint at each B).
 
 Initial guidance:
 
@@ -1218,13 +1552,16 @@ Initial guidance:
 Profile lock contention and per-bin work distribution; tune. The
 memory cost of "more bins" is negligible at any sane resolution
 (§5.2), so the practical lower bound on T comes from §6.2 (renderer
-claim contention) rather than memory pressure.
+contention) rather than memory pressure.
 
 ### 6.6 Fairness (Severity: low)
 
-`atomicCAS` provides no fairness guarantee. In practice with persistent
-WGs, `B >> N`, and stride-offset hashing, all WGs make forward
-progress. If a future workload shows starvation, consider ticket locks.
+`atomicCAS` provides no fairness guarantee. In practice with
+persistent WGs, `B >> N`, and the FIFO ready ring, all WGs make
+forward progress and the host's submit order is preserved on the
+visible ordering of empty→non-empty events. If a future workload
+shows starvation, consider ticket locks on the host queue or a
+priority-queued ready ring.
 
 ### 6.7 Sharded Host Queues (Severity: enhancement)
 
@@ -1250,21 +1587,28 @@ that all primitives of frame F have been rasterized so it can flip
 the framebuffer. cuRE side-steps this by making the megakernel
 per-draw, but our persistent megakernel needs an in-kernel ack. See
 `frame-completion-detection.md` for variants and the recommended
-shape (V2: bulk per-frame counter with per-WG accumulator). Integration
-points:
+shape (V2: bulk per-frame counter with per-WG accumulator).
+Integration points with this design:
 
-- §2.4 (distributor): forward `batch.frame_id` into each `TileEntry`.
-- §2.5 (renderer): add a phase-4 `ack_drain` that flushes a per-WG
-  SGPR accumulator into a global
+- §2.4 (distributor): pack `batch.frame_id` into the high 16 bits
+  of each `TileEntry`. The 4-byte `TileEntry` already accommodates
+  this — `prim_id` (16) + `frame_id` (16) — so no per-tile size
+  change.
+- §2.5 (renderer): each loop iteration's `ack_drain` flushes a
+  per-WG SGPR accumulator into the global
   `frame_ack[FRAME_SLOT(F)].rendered`, where
-  `FRAME_SLOT(F) = F % NUM_INFLIGHT_FRAMES` (`frame-completion-detection.md`
-  §5.1). `NUM_INFLIGHT_FRAMES` is the host's frame ring depth (2–4),
+  `FRAME_SLOT(F) = F % NUM_INFLIGHT_FRAMES`
+  (`frame-completion-detection.md` §5.1).
+  `NUM_INFLIGHT_FRAMES` is the host's frame ring depth (2–4),
   unrelated to `N` (resident WG count).
 - §2.7 (host push): host seals the frame by storing
   `frame_ack[FRAME_SLOT(F)].expected = N_F` after pushing all
   batches, where `N_F` is the primitive count of frame F.
-- Tile queue entry size grows from 4 B to 8 B (or pack `frame_id`
-  into high bits of `prim_id`); revisit §5.1 memory tables.
+
+The `ready` ring carries only tile IDs (no frame ID), so a tile that
+has work for multiple frames is enqueued once and the renderer
+processes them in append order — the per-entry `frame_id` makes
+ack_drain safe across frames.
 
 ## 7. Persistence Infrastructure
 
@@ -1289,15 +1633,15 @@ both modes returned "no work" *and* `terminate == 1`:
 
 - `try_claim(&host_queue_lock)` either failed or the popped batch
   was empty;
-- `pick_tile()` returned `NO_TILE`, or the chosen tile was already
-  claimed by another renderer;
+- `ready.pop()` returned false (no tile is in the ready ring);
 - `terminate == 1`.
 
 This is the "drained" condition: with the host no longer pushing,
-host queue empty, and no tile that this WG can claim (every
-remaining tile is either empty or already mid-render), there is
-nothing left for this WG to do. Other WGs that still have a tile
-locked finish their phase-3 rasterize and reach the same predicate
+host queue empty, and the ready ring empty (every remaining tile
+is either empty or already mid-render with another WG holding its
+`render_lock`), there is nothing left for this WG to do. Other WGs
+that still hold a `render_lock` finish their drain-rasterize loop
+and reach the same predicate
 on the next iteration. The dispatch fence signals once every WG
 has exited.
 
@@ -1439,20 +1783,32 @@ The minimal shippable instantiation, in priority order:
    distinction by `wg_id`.
 2. **Waves per WG**: `W = 4`, wave64.
 3. **Locks**: `host_queue_lock` (binary, single uint32_t) in
-   fine-grained SVM (host+GPU shared, §2.2.1); `tile_lock[B]`
-   (3-state, two-bit field per tile, §2.2.2) in VRAM (GPU-only). CAS
-   acquire, no spin on failure.
-4. **Mode selection**: greedy pop-then-distribute (§3.1) as baseline;
-   switch to demand-based pop (§3.2) if host queue often empty.
-5. **Distribute mode**: pop one batch under `host_queue_lock`, release
-   immediately (§2.3); then bucket by tile in LDS (per-batch tile set)
-   and push each bucket under that tile's `TILE_QLOCK` bit (acquired
-   from either UNLOCKED or RENDERING). Phase-2 retries contended tiles.
-6. **Render mode**: 3-phase protocol (§2.5) — acquire from UNLOCKED,
-   drain into LDS, transition to TILE_RENDER, rasterize, release. New
-   pushes during rasterize are rendered next claim of this tile.
-7. **Tile selection**: stride-offset linear scan with `tile_pending`
-   skip (§4.1).
+   fine-grained SVM (host+GPU shared, §2.2.1); per-tile
+   `queue_lock` (binary, brief, §2.2.2) and `render_lock` (binary,
+   long, §2.2.3) plus the `in_ready` flag (§2.2.4) in VRAM
+   (GPU-only). CAS acquire, no spin on failure. Single MPMC `ready`
+   ring of tile IDs in VRAM.
+4. **Mode selection**: queue-depth-biased per-WG pick (§3.3) as the
+   canonical baseline — `p_distribute = h / (h + r + 1)`, two relaxed
+   reads + xorshift32 per iteration. §3.1 (greedy) and §3.2
+   (demand-based) live as the fallbacks inside each branch. Tune with
+   §3.4 `α`-weights only if profiling shows persistent imbalance.
+5. **Distribute mode**: pop one batch under `host_queue_lock`,
+   release immediately (§2.3); then bucket by tile in LDS (per-batch
+   tile set) and push each bucket under that tile's `queue_lock`. On
+   the empty→non-empty transition, CAS `in_ready` 0→1 and push the
+   tile ID into the ready ring (§2.4). Phase-2 retries contended
+   tiles.
+6. **Render mode**: pop a tile ID from the ready ring; CAS
+   `render_lock`; on contention, re-push the tile ID and return.
+   Otherwise enter the drain-rasterize loop (§2.5) — each iteration
+   takes `queue_lock` for a brief drain to LDS, releases, then
+   rasterizes; loop exits when a drain finds the buffer empty
+   (`in_ready` cleared inside `queue_lock`). Distributors may push
+   to T concurrently with rasterization; their prims are picked up
+   by the next loop iteration.
+7. **Tile selection**: O(1) `ready.pop()`. No per-tile scan
+   (§4.1).
 8. **Within-WG sub-tile**: LDS atomic-CAS sub-tile claim (§2.6), 16
    sub-tiles per coarse bin, 4 waves.
 9. **Backoff** (§2.7 host, §2.8 GPU). Host: spin 256 × `cpu_relax`,
@@ -1487,9 +1843,10 @@ test before any presentation code exists.
    non-persistent megakernel that drains the upload, exits. Same
    pipeline kernel as the final design but without the host↔GPU
    ring or persistent loop. Fastest to a pixel-on-screen
-   (headless) and exercises the bin-ownership locks and 3-state
-   per-tile protocol. Validated by pixel-equality + invariant
-   tests (`headless-testing.md` §3.1, §3.2).
+   (headless) and exercises the bin-ownership locks (`queue_lock`,
+   `render_lock`, `in_ready`) and the ready-ring distribute/render
+   protocol. Validated by pixel-equality + invariant tests
+   (`headless-testing.md` §3.1, §3.2).
 2. **Stage 1: Persistent megakernel with terminate flag.** Add the
    `terminate` flag (§7.1) and oversubscription (§7.2). The
    megakernel runs across multiple frames; per-frame completion

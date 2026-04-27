@@ -98,33 +98,47 @@ These tests target the rasterizer math, not the binning protocol.
 
 The bin-ownership locks (§2.2 of bin-ownership) are the hardest
 part of the pipeline to validate. A pixel-equality test will not
-catch a missed wakeup or a rare 3-state-lock corner case.
+catch a missed wakeup or a rare lock corner case — for example a
+ready-ring entry that's pushed but never popped because of an
+`in_ready` race, or a renderer that loses primitives across the
+empty-drain exit.
 
 Approach: run the pipeline for `S` seconds with a synthetic load
 designed to hit lock contention:
 
 - **Hot tile**: all primitives target a single tile, so
-  distributors and renderers contend on the same `tile_lock` every
-  iteration. Verifies that distributor pushes and renderer
-  rasterizes do overlap (§2.5) without dropping primitives.
+  distributors push to that tile's `queue_lock` while one renderer
+  holds its `render_lock` every iteration. Verifies that
+  distributor pushes and renderer rasterization overlap (§2.5)
+  without dropping primitives, and that the `in_ready` clear
+  inside `queue_lock` re-publishes the tile to the ready ring
+  whenever the renderer's empty drain races a fresh push.
 - **Hot host queue**: many small batches at high frequency, so
   the host and GPU contend on `host_queue_lock` constantly.
   Verifies the layered backoff protocol (§2.7).
 - **Adversarial sizes**: batch sizes that don't divide evenly into
   the host queue's free space, forcing partial pushes and host-side
   retry loops.
+- **Renderer churn**: many renderer WGs popping the same hot
+  tile's ID from the ready ring within the narrow re-push window
+  (§6.2). Verifies that `try_claim(&render_lock)` failures
+  re-push the tile rather than leaking work.
 
 Build the kernel with **debug counters** in fine-grained SVM:
-incremented on contended-acquire, on `wg_backoff` calls per tier,
-on tile-queue overflow. After the run the host reads the counters
-and compares to expected ranges (`hot tile` should show non-zero
-contended-acquire; a `cold tile` baseline should show ~zero).
+incremented on contended-acquire (per lock kind), on `wg_backoff`
+calls per tier, on tile-queue overflow, on `try_claim(&render_lock)`
+failures, and on `ready.push`/`ready.pop` returning false. After
+the run the host reads the counters and compares to expected
+ranges (`hot tile` should show non-zero contended `queue_lock`;
+a `cold tile` baseline should show ~zero).
 
 For correctness invariants — *no two renderers ever rasterize the
-same tile concurrently* — the kernel can write a per-tile
-"in-rasterize" flag and assert in the renderer that it transitions
-0→1→0 cleanly. The assertion writes to a global "trap log" buffer
-that the host inspects after the run.
+same tile concurrently*, *every primitive pushed by the host is
+counted in `frame_ack[].rendered` exactly once* — the kernel can
+write per-tile "in-rasterize" flags and per-frame-id "rasterized"
+counters that assert in the renderer that they transition
+0→1→0 cleanly. The assertion writes to a global "trap log"
+buffer that the host inspects after the run.
 
 ### 3.4 Frame-Completion Tests
 

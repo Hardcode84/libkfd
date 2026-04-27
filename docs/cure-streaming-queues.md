@@ -457,7 +457,9 @@ In priority order if any of this is to be ported:
   `BinTileSpace.cuh`, and `BinTileRasterizationStage.cuh`.
 - `bin-ownership-pipeline-proposal.md` in this directory — the
   AMDGPU/libkfd port of the cuRE shape with dynamic per-WG role
-  selection and 3-state per-tile locks.
+  selection, per-tile `queue_lock` + `render_lock` binary locks, and
+  a global `ready` ring of tile IDs in place of cuRE's bin-vs-tile
+  scan.
 - `frame-completion-detection.md` — how the host detects per-frame
   completion against a persistent megakernel, since cuRE's
   kernel-per-draw-call model does not generalize.

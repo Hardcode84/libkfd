@@ -21,20 +21,18 @@ pipeline. None is implemented yet; they are the blueprint.
    picks distribute-mode (drain host queue, scatter primitives into
    per-tile queues) or render-mode (drain a tile, rasterize) per
    iteration via dynamic ownership locks. Single binary host queue
-   lock shared between host and GPU; 3-state per-tile locks that
-   let distributor pushes and renderer rasterizes overlap.
-3. `active-tile-queue-handoff.md` — a refinement to renderer work
-   discovery and frame handoff. Distributors append populated tile
-   IDs to an active tile queue; renderers pop that queue instead of
-   scanning all tile queues. The note also sketches EOF/drain
-   predicates for non-cooperative completion and future cooperative
-   grid-barrier handoff.
-4. `frame-completion-detection.md` — how the host detects
+   lock shared between host and GPU; per-tile `queue_lock` (brief)
+   and `render_lock` (long) plus an `in_ready` flag and a global
+   MPMC `ready` ring of tile IDs. Distributors push tile IDs into
+   the ring on each empty→non-empty transition; renderers pop in
+   O(1) without scanning. See §1.1 for what changed since the first
+   prototype.
+3. `frame-completion-detection.md` — how the host detects
    end-of-frame against a *persistent* megakernel, since cuRE's
    "kernel-per-draw-call exit" does not generalize. Recommends a
    bulk per-frame counter with per-WG SGPR accumulator; documents
    both polling and KFD-signal interrupt-driven host-wait paths.
-5. `headless-testing.md` — running the kernel in CI / on a
+4. `headless-testing.md` — running the kernel in CI / on a
    display-less dev box. Same kernel binary as the windowed demo;
    readback replaces flip. Defines test categories (pixel-equality,
    invariants, concurrency stress, frame-completion, termination,
@@ -94,8 +92,11 @@ These docs cover the **rasterization pipeline** end-to-end:
 - **NUM_INFLIGHT_FRAMES** — host's frame-ring depth (typically 2–4),
   unrelated to `N`.
 - **B/N** — design-determining ratio. Three regimes:
-  - `B/N ≥ 16` — robust; random tile claim is essentially uncontended.
-  - `4 ≤ B/N < 16` — works with picking heuristics (`bin-ownership-pipeline-proposal.md` §4).
+  - `B/N ≥ 16` — robust; renderer pops the ready ring and almost
+    never re-pushes on `render_lock` contention.
+  - `4 ≤ B/N < 16` — works; the ready ring still serves all renderers
+    in O(1) but `render_lock` re-pushes become measurable
+    (`bin-ownership-pipeline-proposal.md` §6.2).
   - `B/N < 4` — breaks down; fixed-role partitioning (a few
     distributor WGs, rest renderers) is the better trade.
 

@@ -270,7 +270,8 @@ FIFO-ordered, so a renderer that drains the tile sees EOF F only
 ```c
 // Distributor on EOF F:
 for (uint32_t t = 0; t < B; ++t) {
-  // claim TILE_QLOCK on tile t, push EOF F entry, release
+  // claim queue_lock on tile t, push EOF F entry, release
+  // (also CAS in_ready 0→1 + ready.push if the tile was empty)
 }
 
 // Renderer drain:
@@ -291,11 +292,12 @@ while (atomic_load(&tile_eof_acks[F % NUM_INFLIGHT_FRAMES]) < B)
 Cost:
 
 - B tile-queue pushes per frame just for EOF (≈ 2040 at 1080p /
-  32×32; ≈ 8160 at 1080p / 16×16). Each push is a `TILE_QLOCK`
-  acquire/release plus 8–16 B of queue data. At an estimated
-  ~100 ns per push that's ~200 μs at 32×32 or ~800 μs at 16×16 of
-  distribute-mode work per frame — too much at the smaller tile
-  size, marginal at the larger.
+  32×32; ≈ 8160 at 1080p / 16×16). Each push is a `queue_lock`
+  acquire/release plus 8–16 B of queue data, plus on the
+  empty→non-empty transition an `in_ready` CAS and a `ready.push`.
+  At an estimated ~100 ns per push that's ~200 μs at 32×32 or
+  ~800 μs at 16×16 of distribute-mode work per frame — too much at
+  the smaller tile size, marginal at the larger.
 - B atomic increments at frame end (one per tile renderer that sees
   EOF). Same cost as ~1 atomic per drain in V2 but with more
   contention (all renderers ack at once at frame end).
@@ -579,26 +581,44 @@ No new atomics. No new failure modes.
 
 ### 5.5 GPU Renderer Side
 
-`render(tile)` per `bin-ownership-pipeline-proposal.md` §2.5 has
-three phases: drain into LDS, transition lock, rasterize. After
-phase 3 (rasterize complete) we add the bulk ack:
+`render(T)` per `bin-ownership-pipeline-proposal.md` §2.5 runs a
+drain-rasterize loop under `render_lock`. Each iteration takes
+`queue_lock` for a brief drain into LDS, releases it, then
+rasterizes — and on the iteration where the drain finds the buffer
+empty it clears `in_ready` and exits. We add the bulk ack at the
+end of every rasterize step:
 
 ```c
-__device__ void render(uint32_t tile) {
-  __shared__ uint32_t lds_count;
-  __shared__ TileEntry lds_entries[MAX_TILE_PRIMS];
+__device__ void render(uint32_t T) {
+  if (!try_claim(&tile[T].render_lock)) {
+    while (!ready.push(T)) wg_backoff(/*ring full*/);
+    return;
+  }
 
-  drain_tile_queue(tile, lds_entries, &lds_count);          // phase 1
-  render_drain_done(tile);                                   // phase 2
+  __shared__ uint32_t  lds_count;
+  __shared__ TileEntry lds_entries[CAP];
 
-  rasterize_tile(tile, lds_entries, lds_count);              // phase 3
+  for (;;) {
+    while (!try_claim(&tile[T].queue_lock)) wg_backoff(/*queue contended*/);
+    uint32_t count = tile[T].head;
+    if (count > 0) {
+      drain_to_lds(tile[T].buf, count, lds_entries);
+      tile[T].head = 0;
+    } else {
+      atomic_store(&tile[T].in_ready, 0);    // open ready-gate inside queue_lock
+    }
+    release(&tile[T].queue_lock);
 
-  // Phase 4: ack frame counts.
-  // Most drains are single-frame; the per-WG accumulator flushes the
-  // common case in zero atomics-per-prim.
-  ack_drain(lds_entries, lds_count);
+    if (count == 0) break;
 
-  render_release(tile);
+    rasterize_tile(T, lds_entries, count);
+
+    // Most drains are single-frame; the per-WG accumulator flushes
+    // the common case in zero atomics-per-prim.
+    ack_drain(lds_entries, count);
+  }
+
+  release(&tile[T].render_lock);
 }
 ```
 
