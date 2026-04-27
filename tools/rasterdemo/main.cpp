@@ -34,8 +34,11 @@ constexpr uint32_t NUM_BUFFERS = 3;
 constexpr uint32_t TILE_SIZE = 32;
 constexpr uint32_t BLOCK_X = 16;
 constexpr uint32_t BLOCK_Y = 16;
-constexpr uint32_t PERSISTENT_BLOCK_X = 32;
-constexpr uint32_t PERSISTENT_BLOCK_Y = 1;
+constexpr uint32_t CLAIM_BLOCK_X = 32;
+constexpr uint32_t CLAIM_BLOCK_Y = 1;
+constexpr uint32_t PERSISTENT_BLOCK_X = 16;
+constexpr uint32_t PERSISTENT_BLOCK_Y = 8;
+constexpr uint32_t DEFAULT_PERSISTENT_WGS = 48;
 constexpr uint32_t STRIDE_ALIGN = 256;
 constexpr uint32_t CLEAR_COLOR = 0xff102030u;
 constexpr float CLEAR_DEPTH = 1.0f;
@@ -649,7 +652,7 @@ int main(int argc, char **argv) {
                   "  --gpu-timeout-ms=N      per-frame GPU timeout "
                   "(default 5000)\n"
                   "  --persistent-wgs=N      persistent workgroups; default "
-                  "is one per CU, capped by tile count\n"
+                  "is 48, capped by tile count\n"
                   "  --probe                 run a one-workgroup dispatch and "
                   "exit\n"
                   "  --clear-only            present clear frames without "
@@ -798,12 +801,7 @@ int main(int argc, char **argv) {
   uint32_t tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
   uint32_t tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
   uint32_t tile_count = tiles_x * tiles_y;
-  uint32_t simd_per_cu = dev.properties().simd_per_cu;
-  uint32_t num_cus =
-      simd_per_cu ? dev.properties().simd_count / simd_per_cu : 0;
-  uint32_t default_persistent_wgs = num_cus;
-  if (default_persistent_wgs == 0)
-    default_persistent_wgs = 32;
+  uint32_t default_persistent_wgs = DEFAULT_PERSISTENT_WGS;
   if (default_persistent_wgs > tile_count)
     default_persistent_wgs = tile_count;
   uint32_t persistent_wgs = requested_persistent_wgs ? requested_persistent_wgs
@@ -891,6 +889,10 @@ int main(int argc, char **argv) {
       .grid = {.x = persistent_wgs},
       .block = {.x = PERSISTENT_BLOCK_X, .y = PERSISTENT_BLOCK_Y},
   };
+  kfd::DispatchConfig claim_cfg{
+      .grid = {.x = persistent_wgs},
+      .block = {.x = CLAIM_BLOCK_X, .y = CLAIM_BLOCK_Y},
+  };
   auto persistent_kernarg = KFD_EXPECT(persistent_kernel.alloc());
   PersistentArgs persistent_args{
       .control = control,
@@ -935,7 +937,7 @@ int main(int argc, char **argv) {
   } else if (kernel_mode == KernelMode::PerFrame) {
     std::printf("Kernel mode: per-frame active tile queue (%u workgroups, %ux%u "
                 "threads)\n",
-                persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
+                persistent_wgs, CLAIM_BLOCK_X, CLAIM_BLOCK_Y);
   } else {
     std::printf("Kernel mode: static grid dispatch per frame\n");
   }
@@ -1039,10 +1041,10 @@ int main(int argc, char **argv) {
           .active_count = tile_count,
       };
       claim_frame_kernel.fill(fbs[current].claim_kernarg, claim_args,
-                              persistent_cfg);
+                              claim_cfg);
 
       KFD_EXPECT(fbs[current].signal->reset());
-      KFD_EXPECT(compute.dispatch(claim_frame_kernel, persistent_cfg,
+      KFD_EXPECT(compute.dispatch(claim_frame_kernel, claim_cfg,
                                   fbs[current].claim_kernarg,
                                   *fbs[current].signal));
       auto waited =

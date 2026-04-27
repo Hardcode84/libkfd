@@ -115,6 +115,19 @@ struct ProbeArgs {
   unsigned *out;
 };
 
+enum {
+  RASTER_TILE_SIZE = 32u,
+  SUBTILE_WIDTH = 16u,
+  SUBTILE_HEIGHT = 4u,
+  SUBTILES_X = RASTER_TILE_SIZE / SUBTILE_WIDTH,
+  SUBTILES_Y = RASTER_TILE_SIZE / SUBTILE_HEIGHT,
+  NUM_SUBTILES = SUBTILES_X * SUBTILES_Y,
+  SUBTILE_PIXELS = SUBTILE_WIDTH * SUBTILE_HEIGHT,
+  PERSISTENT_WAVE_COUNT = 4u,
+  SUBTILE_PASSES_PER_WAVE =
+      (NUM_SUBTILES + PERSISTENT_WAVE_COUNT - 1u) / PERSISTENT_WAVE_COUNT,
+};
+
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_claimed_tile;
 [[clang::loader_uninitialized]]
@@ -123,6 +136,12 @@ static __gpu_local volatile unsigned lds_tile_range_offset;
 static __gpu_local volatile unsigned lds_tile_range_count;
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_frame_closed;
+[[clang::loader_uninitialized]]
+static __gpu_local volatile unsigned lds_current_epoch;
+[[clang::loader_uninitialized]]
+static __gpu_local volatile unsigned lds_terminate;
+[[clang::loader_uninitialized]]
+static __gpu_local volatile unsigned lds_subtile_table[NUM_SUBTILES];
 
 static float edge(float ax, float ay, float bx, float by, float px, float py) {
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
@@ -254,6 +273,116 @@ static void raster_tile(const struct DemoPrimitive *prims,
   }
 }
 
+static void clear_subtile(unsigned *color, float *depth, unsigned width,
+                          unsigned height, unsigned pitch, unsigned tile_size,
+                          unsigned clear_color, float clear_depth,
+                          unsigned tile_x, unsigned tile_y, unsigned subtile,
+                          unsigned lane) {
+  unsigned sub_x = (subtile % SUBTILES_X) * SUBTILE_WIDTH;
+  unsigned sub_y = (subtile / SUBTILES_X) * SUBTILE_HEIGHT;
+  unsigned base_x = tile_x * tile_size + sub_x;
+  unsigned base_y = tile_y * tile_size + sub_y;
+
+  for (unsigned p = lane; p < SUBTILE_PIXELS; p += 32u) {
+    unsigned x = base_x + (p % SUBTILE_WIDTH);
+    unsigned y = base_y + (p / SUBTILE_WIDTH);
+    if (x >= width || y >= height)
+      continue;
+    unsigned idx = y * pitch + x;
+    depth[idx] = clear_depth;
+    color[idx] = clear_color;
+  }
+}
+
+static void raster_subtile(const struct DemoPrimitive *prims,
+                           const unsigned *tile_indices,
+                           struct TileRange range, unsigned *color,
+                           float *depth, unsigned width, unsigned height,
+                           unsigned pitch, unsigned tile_size,
+                           unsigned clear_color, float clear_depth,
+                           unsigned tile_x, unsigned tile_y, unsigned subtile,
+                           unsigned lane) {
+  unsigned sub_x = (subtile % SUBTILES_X) * SUBTILE_WIDTH;
+  unsigned sub_y = (subtile / SUBTILES_X) * SUBTILE_HEIGHT;
+  unsigned base_x = tile_x * tile_size + sub_x;
+  unsigned base_y = tile_y * tile_size + sub_y;
+
+  for (unsigned p = lane; p < SUBTILE_PIXELS; p += 32u) {
+    unsigned x = base_x + (p % SUBTILE_WIDTH);
+    unsigned y = base_y + (p / SUBTILE_WIDTH);
+    if (x >= width || y >= height)
+      continue;
+
+    float px = (float)x + 0.5f;
+    float py = (float)y + 0.5f;
+    float best_depth = clear_depth;
+    unsigned best_color = clear_color;
+
+    for (unsigned j = 0; j < range.count; ++j) {
+      unsigned i = tile_indices[range.offset + j];
+      struct DemoPrimitive tri = prims[i];
+      float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
+                        tri.v2.y);
+      if (area > -0.00001f && area < 0.00001f)
+        continue;
+
+      float w0 = edge(tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y, px, py) / area;
+      float w1 = edge(tri.v2.x, tri.v2.y, tri.v0.x, tri.v0.y, px, py) / area;
+      float w2 = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, px, py) / area;
+      if (w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f)
+        continue;
+
+      float z = w0 * tri.v0.z + w1 * tri.v1.z + w2 * tri.v2.z;
+      if (z < 0.0f || z > best_depth)
+        continue;
+
+      float u = w0 * tri.v0.u + w1 * tri.v1.u + w2 * tri.v2.u;
+      float v = w0 * tri.v0.v + w1 * tri.v1.v + w2 * tri.v2.v;
+      best_depth = z;
+      best_color = shade_checker(u, v);
+    }
+
+    unsigned idx = y * pitch + x;
+    depth[idx] = best_depth;
+    color[idx] = best_color;
+  }
+}
+
+static void process_tile_subtiled(const struct DemoPrimitive *prims,
+                                  const unsigned *tile_indices,
+                                  struct TileRange range, unsigned *color,
+                                  float *depth, unsigned width,
+                                  unsigned height, unsigned pitch,
+                                  unsigned tile_size, unsigned clear_color,
+                                  float clear_depth, unsigned tile_x,
+                                  unsigned tile_y, unsigned clear_only,
+                                  unsigned tid) {
+  const unsigned lane = tid & 31u;
+  const unsigned wave = tid >> 5u;
+
+  if (tid < NUM_SUBTILES)
+    lds_subtile_table[tid] = tid;
+  __gpu_sync_threads();
+
+  if (wave < PERSISTENT_WAVE_COUNT) {
+    for (unsigned pass = 0; pass < SUBTILE_PASSES_PER_WAVE; ++pass) {
+      unsigned index = pass * PERSISTENT_WAVE_COUNT + wave;
+      if (index >= NUM_SUBTILES)
+        continue;
+
+      unsigned subtile = lds_subtile_table[index];
+      if (clear_only) {
+        clear_subtile(color, depth, width, height, pitch, tile_size,
+                      clear_color, clear_depth, tile_x, tile_y, subtile, lane);
+      } else {
+        raster_subtile(prims, tile_indices, range, color, depth, width, height,
+                       pitch, tile_size, clear_color, clear_depth, tile_x,
+                       tile_y, subtile, lane);
+      }
+    }
+  }
+}
+
 __gpu_kernel void rasterdemo_clear_frame(struct RasterArgs args) {
   clear_tile(args.color, args.depth, args.width, args.height, args.pitch,
              args.tile_size, args.clear_color, args.clear_depth,
@@ -320,11 +449,18 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                      __gpu_num_threads_y();
 
   for (;;) {
-    if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
+    if (tid == 0) {
+      lds_terminate =
+          __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
+      lds_current_epoch =
+          __atomic_load_n(&args.control->current_epoch, __ATOMIC_ACQUIRE);
+    }
+    __gpu_sync_threads();
+
+    if (lds_terminate != 0)
       break;
 
-    unsigned epoch =
-        __atomic_load_n(&args.control->current_epoch, __ATOMIC_ACQUIRE);
+    unsigned epoch = lds_current_epoch;
     if (epoch == 0 || epoch == seen_epoch) {
       __builtin_amdgcn_s_sleep(4);
       continue;
@@ -354,7 +490,11 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                                             __ATOMIC_ACQUIRE);
 
     for (;;) {
-      if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
+      if (tid == 0)
+        lds_terminate =
+            __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
+      __gpu_sync_threads();
+      if (lds_terminate != 0)
         return;
 
       if (tid == 0)
@@ -365,12 +505,15 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       unsigned tile = lds_claimed_tile;
       if (tile == 0xffffffffu) {
         for (;;) {
-          if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
-            return;
-          if (tid == 0)
+          if (tid == 0) {
+            lds_terminate =
+                __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
             lds_frame_closed =
                 try_complete_epoch(args.control, epoch, active_count);
+          }
           __gpu_sync_threads();
+          if (lds_terminate != 0)
+            return;
           if (lds_frame_closed)
             break;
           __builtin_amdgcn_s_sleep(4);
@@ -385,18 +528,14 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       __gpu_sync_threads();
       unsigned tile_x = tile % f.tiles_x;
       unsigned tile_y = tile / f.tiles_x;
-      if (f.clear_only) {
-        clear_tile(f.color, f.depth, f.width, f.height, f.pitch, f.tile_size,
-                   f.clear_color, f.clear_depth, tile_x, tile_y);
-      } else {
-        struct TileRange range = {
-            .offset = lds_tile_range_offset,
-            .count = lds_tile_range_count,
-        };
-        raster_tile(f.prims, f.tile_indices, range, f.color, f.depth, f.width,
-                    f.height, f.pitch, f.tile_size, f.clear_color,
-                    f.clear_depth, tile_x, tile_y);
-      }
+      struct TileRange range = {
+          .offset = lds_tile_range_offset,
+          .count = lds_tile_range_count,
+      };
+      process_tile_subtiled(f.prims, f.tile_indices, range, f.color, f.depth,
+                            f.width, f.height, f.pitch, f.tile_size,
+                            f.clear_color, f.clear_depth, tile_x, tile_y,
+                            f.clear_only, tid);
       __gpu_sync_threads();
 
       if (__gpu_thread_id_x() == 0 && __gpu_thread_id_y() == 0 &&
