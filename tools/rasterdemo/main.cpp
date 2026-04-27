@@ -83,13 +83,14 @@ struct RasterArgs {
 
 struct PersistentControl {
   uint32_t terminate;
-  uint32_t ready;
-  uint32_t frame_id;
+  uint32_t current_epoch;
+  uint32_t sealed_epoch;
+  uint32_t closing_epoch;
+  uint32_t completed_epoch;
   uint32_t active_slot;
   uint32_t active_cursor;
-  uint32_t tiles_done;
-  uint32_t frame_done;
   uint32_t active_count;
+  uint32_t render_done;
 };
 
 struct ClaimFrameArgs {
@@ -1054,31 +1055,40 @@ int main(int argc, char **argv) {
         return 1;
       }
     } else {
-      uint32_t frame_id = frame + 1;
-      __atomic_store_n(&control->tiles_done, 0u, __ATOMIC_RELEASE);
+      uint32_t epoch = frame + 1;
       __atomic_store_n(&control->active_cursor, 0u, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->render_done, 0u, __ATOMIC_RELEASE);
       __atomic_store_n(&control->active_slot, current, __ATOMIC_RELEASE);
       __atomic_store_n(&control->active_count, tile_count, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->frame_id, frame_id, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->current_epoch, epoch, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
-      __atomic_store_n(&control->ready, 1u, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->sealed_epoch, epoch, __ATOMIC_RELEASE);
 
       auto deadline = std::chrono::steady_clock::now() +
                       std::chrono::nanoseconds(gpu_timeout_ns);
-      while (__atomic_load_n(&control->frame_done, __ATOMIC_ACQUIRE) !=
-             frame_id) {
+      while (__atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) !=
+             epoch) {
         if (std::chrono::steady_clock::now() > deadline) {
           std::fprintf(stderr,
                        "error: frame %u persistent GPU wait timed out "
-                       "(ready=%u frame_id=%u active_cursor=%u "
-                       "tiles_done=%u frame_done=%u active_count=%u)\n",
-                       frame, __atomic_load_n(&control->ready, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->frame_id, __ATOMIC_ACQUIRE),
+                       "(current_epoch=%u sealed_epoch=%u closing_epoch=%u "
+                       "completed_epoch=%u active_cursor=%u active_count=%u "
+                       "render_done=%u)\n",
+                       frame,
+                       __atomic_load_n(&control->current_epoch,
+                                       __ATOMIC_ACQUIRE),
+                       __atomic_load_n(&control->sealed_epoch,
+                                       __ATOMIC_ACQUIRE),
+                       __atomic_load_n(&control->closing_epoch,
+                                       __ATOMIC_ACQUIRE),
+                       __atomic_load_n(&control->completed_epoch,
+                                       __ATOMIC_ACQUIRE),
                        __atomic_load_n(&control->active_cursor,
                                        __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->tiles_done, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->frame_done, __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE));
+                       __atomic_load_n(&control->active_count,
+                                       __ATOMIC_ACQUIRE),
+                       __atomic_load_n(&control->render_done,
+                                       __ATOMIC_ACQUIRE));
           __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
           KFD_EXPECT(compute.signal(shutdown_signal));
           (void)shutdown_signal.wait(kfd::Condition::EQ, 0,

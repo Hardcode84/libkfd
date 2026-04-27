@@ -74,13 +74,14 @@ struct ClaimFrameArgs {
 
 struct PersistentControl {
   volatile unsigned terminate;
-  volatile unsigned ready;
-  volatile unsigned frame_id;
+  volatile unsigned current_epoch;
+  volatile unsigned sealed_epoch;
+  volatile unsigned closing_epoch;
+  volatile unsigned completed_epoch;
   volatile unsigned active_slot;
   volatile unsigned active_cursor;
-  volatile unsigned tiles_done;
-  volatile unsigned frame_done;
   volatile unsigned active_count;
+  volatile unsigned render_done;
 };
 
 struct PersistentArgs {
@@ -120,6 +121,8 @@ static __gpu_local volatile unsigned lds_claimed_tile;
 static __gpu_local volatile unsigned lds_tile_range_offset;
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_tile_range_count;
+[[clang::loader_uninitialized]]
+static __gpu_local volatile unsigned lds_frame_closed;
 
 static float edge(float ax, float ay, float bx, float by, float px, float py) {
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
@@ -138,6 +141,25 @@ static unsigned pop_active_tile(volatile unsigned *cursor,
   if (index >= active_count)
     return 0xffffffffu;
   return __atomic_load_n(&active_tiles[index], __ATOMIC_ACQUIRE);
+}
+
+static unsigned try_complete_epoch(struct PersistentControl *control,
+                                   unsigned epoch, unsigned active_count) {
+  unsigned sealed = __atomic_load_n(&control->sealed_epoch, __ATOMIC_ACQUIRE);
+  unsigned cursor = __atomic_load_n(&control->active_cursor, __ATOMIC_ACQUIRE);
+  unsigned done = __atomic_load_n(&control->render_done, __ATOMIC_ACQUIRE);
+  if (sealed < epoch || cursor < active_count || done < active_count)
+    return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >= epoch;
+
+  unsigned expected = epoch - 1u;
+  if (__atomic_compare_exchange_n(&control->closing_epoch, &expected, epoch,
+                                  false, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&control->completed_epoch, epoch, __ATOMIC_RELEASE);
+    return 1u;
+  }
+
+  return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >= epoch;
 }
 
 __gpu_kernel void rasterdemo_probe(struct ProbeArgs args) {
@@ -291,7 +313,7 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
 
 __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
   struct PersistentArgs args = *launch.args;
-  unsigned seen_frame = 0xffffffffu;
+  unsigned seen_epoch = 0;
   unsigned tid = __gpu_thread_id_x() +
                  __gpu_thread_id_y() * __gpu_num_threads_x() +
                  __gpu_thread_id_z() * __gpu_num_threads_x() *
@@ -301,9 +323,9 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
       break;
 
-    unsigned ready = __atomic_load_n(&args.control->ready, __ATOMIC_ACQUIRE);
-    unsigned frame = __atomic_load_n(&args.control->frame_id, __ATOMIC_ACQUIRE);
-    if (ready == 0 || frame == seen_frame) {
+    unsigned epoch =
+        __atomic_load_n(&args.control->current_epoch, __ATOMIC_ACQUIRE);
+    if (epoch == 0 || epoch == seen_epoch) {
       __builtin_amdgcn_s_sleep(4);
       continue;
     }
@@ -332,14 +354,29 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                                             __ATOMIC_ACQUIRE);
 
     for (;;) {
+      if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
+        return;
+
       if (tid == 0)
         lds_claimed_tile =
             pop_active_tile(&args.control->active_cursor, f.active_tiles,
                             active_count);
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
-      if (tile == 0xffffffffu)
+      if (tile == 0xffffffffu) {
+        for (;;) {
+          if (__atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE) != 0)
+            return;
+          if (tid == 0)
+            lds_frame_closed =
+                try_complete_epoch(args.control, epoch, active_count);
+          __gpu_sync_threads();
+          if (lds_frame_closed)
+            break;
+          __builtin_amdgcn_s_sleep(4);
+        }
         break;
+      }
       if (tid == 0) {
         struct TileRange range = f.tile_ranges[tile];
         lds_tile_range_offset = range.offset;
@@ -364,18 +401,14 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
 
       if (__gpu_thread_id_x() == 0 && __gpu_thread_id_y() == 0 &&
           __gpu_thread_id_z() == 0) {
-        unsigned done =
-            __atomic_fetch_add(&args.control->tiles_done, 1u,
-                               __ATOMIC_ACQ_REL) +
-            1u;
-        if (done == active_count) {
-          __atomic_store_n(&args.control->frame_done, frame, __ATOMIC_RELEASE);
-          __atomic_store_n(&args.control->ready, 0u, __ATOMIC_RELEASE);
-        }
+        __atomic_fetch_add(&args.control->render_done, 1u, __ATOMIC_ACQ_REL);
+        lds_frame_closed = try_complete_epoch(args.control, epoch, active_count);
       }
       __gpu_sync_threads();
+      if (lds_frame_closed)
+        break;
     }
 
-    seen_frame = frame;
+    seen_epoch = epoch;
   }
 }
