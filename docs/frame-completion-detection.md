@@ -3,12 +3,12 @@
 How does the host know that all primitives of frame F have actually
 been rasterized into the framebuffer, so it can flip / present?
 
-This is an underdefined area in both `streaming-pipeline-proposal.md`
-and `bin-ownership-pipeline-proposal.md`. Both proposals assume a
-persistent megakernel that lives across many frames; the kernel does
-not exit at frame boundaries, so there is no `cudaDeviceSynchronize`-
-or fence-on-dispatch-complete equivalent. Frame completion has to be
-detected *inside* the live pipeline and *signalled out* to the host.
+This is an underdefined area in `bin-ownership-pipeline-proposal.md`.
+That proposal assumes a persistent megakernel that lives across many
+frames; the kernel does not exit at frame boundaries, so there is no
+`cudaDeviceSynchronize`- or fence-on-dispatch-complete equivalent.
+Frame completion has to be detected *inside* the live pipeline and
+*signalled out* to the host.
 
 This document:
 
@@ -409,8 +409,8 @@ megakernel the dispatch never completes until app shutdown, so this
 is nothing more than a shutdown signal. Inapplicable to per-frame
 detection.
 
-The streaming proposal's §2.8 termination flag is in this family: it
-flips for app exit, not for per-frame completion.
+The bin-ownership proposal's §7.1 `terminate` flag is in this
+family: it flips for app exit, not for per-frame completion.
 
 ## 4. Recommendation
 
@@ -895,10 +895,10 @@ when measurements justify the helper-queue plumbing.
 - `cure-streaming-queues.md` §3.2 (this repo) — `ProgressQueue`
   watermark for primitive ordering, contrasted with frame
   completion.
-- `streaming-pipeline-proposal.md` §2.8 — termination flag
-  (app-shutdown, not per-frame).
 - `bin-ownership-pipeline-proposal.md` §2.7 — host push protocol that
   this proposal layers on top.
+- `bin-ownership-pipeline-proposal.md` §7.1 — `terminate` flag
+  (app-shutdown, not per-frame).
 - `include/libkfd/event.h` — KFD event RAII wrapper used by §5.8.
 - `include/libkfd/signal.h` — `Signal::wait(spin_then_block)` used by
   §5.8.

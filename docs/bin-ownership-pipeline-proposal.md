@@ -1,17 +1,16 @@
-# Bin-Ownership Pipeline Proposal
+# Pipeline Proposal: Bin-Ownership Megakernel
 
-Status: design proposal. Alternative to `streaming-pipeline-proposal.md`.
+Status: design proposal. Not implemented. The canonical pipeline
+shape for the streaming-rasterizer demo on AMDGPU + libkfd.
 
-The streaming proposal partitions work *structurally*: one distributor WG
-with wave-disjoint bin partitioning, and N-1 renderer WGs as multi-consumer
-of bin queues. Roles are fixed at WG-launch time by `wg_id`.
+The pipeline is one persistent compute megakernel running `N`
+symmetric workgroups. Each WG, on each iteration, picks one of two
+modes:
 
-This proposal partitions work *dynamically*: every WG is symmetric and,
-each iteration, picks one of two modes:
-
-1. **Distribute mode**: drain the host queue, populate the relevant tile
-   queues with the batch's primitives.
-2. **Render mode**: drain a single tile queue, rasterize it.
+1. **Distribute mode**: pop a primitive batch from the host↔GPU
+   ring, scatter the batch's primitives into per-tile queues.
+2. **Render mode**: drain one tile's queue, rasterize the
+   primitives, write the framebuffer slice for that tile.
 
 Mutual exclusion is enforced via two kinds of ownership locks:
 
@@ -30,34 +29,32 @@ lock and other WGs (or the host) re-claim it. Each tile cycles
 through queue-access and rendering states independently and can
 overlap them.
 
-Read `streaming-pipeline-proposal.md` first for shared vocabulary
-(megakernel, persistent WGs, fine-grained SVM, batch records, oversubscribed
-launch, host-side ring buffer, watchdog). This document only describes
-what differs.
+Companion docs:
+
+- `cure-streaming-queues.md` — vocabulary for streaming queue
+  primitives borrowed from cuRE.
+- `frame-completion-detection.md` — how the host detects end-of-
+  frame against the persistent megakernel.
 
 ## 1. Why This Shape
 
-The streaming proposal works cleanly when:
+The bin-ownership shape is robust against three failure modes that
+fixed-role designs (one distributor WG, N−1 renderer WGs) struggle
+with:
 
-- Coarse bin count `B` is moderate.
-- Per-bin workload is roughly uniform.
-- Producer/consumer balance is steady within a frame.
+- **`B` much larger than `N` (resident WG count).** A single
+  distributor WG cannot keep up with binning when there are many
+  bins; renderers idle waiting for fan-out. Bin-ownership lets every
+  WG distribute when the host queue has work and render otherwise.
+- **High per-bin work variance.** A few hot bins bottleneck while
+  idle renderer WGs cannot help. Bin-ownership lets idle WGs claim
+  any unrendered tile.
+- **Bursty producer load.** A fixed distributor WG saturates while
+  renderer WGs idle, or vice versa. Bin-ownership absorbs bursts by
+  letting any WG distribute.
 
-It struggles when:
-
-- `B` is much larger than `N` (resident WG count). Wave-disjoint
-  partitioning under-uses parallelism: only one distributor WG of `W`
-  waves works on the entire bin set.
-- Per-bin work variance is high. A few hot bins bottleneck while idle
-  WGs cannot help.
-- Producer load is bursty. The fixed distributor WG saturates while
-  renderer WGs idle, or vice versa.
-
-The two-mode lock-based model addresses these by making any WG capable
-of either role per iteration. The active distributor identity rotates
-dynamically, and the renderer pool absorbs idle capacity.
-
-Concrete numbers (RDNA2 6700 XT, ~80 resident WGs at typical occupancy):
+`B` and `N` define a design-determining ratio. Concrete numbers
+(RDNA2 6700 XT, ~80 resident WGs at typical occupancy):
 
 | Render res | Coarse bin size | B | B/N |
 |---|---|---|---|
@@ -69,12 +66,11 @@ Concrete numbers (RDNA2 6700 XT, ~80 resident WGs at typical occupancy):
 | 4K | 128×128 | ~510 | 6   |
 
 The model is robust at `B/N ≥ 16` (random tile claim is essentially
-uncontended). It works at `4 ≤ B/N ≤ 16` with picking heuristics. It
-breaks down below `B/N < 4`.
-
-For the 1080p teapot demo (~6 K triangles, B/N ≈ 25 at 32×32 tiles),
-the streaming proposal is the simpler trade. For 4K or higher-density
-scenes, this proposal is.
+uncontended). It works at `4 ≤ B/N ≤ 16` with picking heuristics
+(§4). It breaks down below `B/N < 4` — at that point a fixed-role
+partitioning scheme (one or a few WGs as distributors, the rest as
+renderers) becomes the better trade. The 1080p teapot demo lands at
+`B/N ≈ 25` with 32×32 bins, comfortably inside the robust regime.
 
 ## 2. Architecture
 
@@ -117,7 +113,7 @@ Host                                GPU (one megakernel)
                                        (per-tile exclusive write)
 ```
 
-Differences from `streaming-pipeline-proposal.md`:
+Key properties:
 
 - The host queue is gated by a single binary lock that is **shared
   between the host and GPU WGs**. The host acquires it to push; a WG
@@ -331,10 +327,13 @@ typical WG iteration is: CAS-acquire (~50 ns) + pop (~few hundred ns,
 one cache line) + release (~50 ns) ≈ 1 μs of lock hold. That's also
 the maximum window the host has to wait per pop.
 
-The wave-level pattern from `streaming-pipeline-proposal.md` §2.3 still
-applies inside `distribute_batch()` and `render()`: wave 0 of the WG
-performs the queue-touching operations, broadcasts via LDS, all `W`
-waves cooperate on the broadcasted unit of work.
+Inside `distribute_batch()` and `render()` the WG uses the standard
+wave-level cooperation pattern: wave 0 performs the queue-touching
+operations (CAS, dequeue head, etc.), writes results into LDS,
+`s_barrier`s, and all `W` waves of the WG then cooperate on the
+broadcasted unit of work. Lane 0 of wave 0 specifically performs the
+atomic CAS on locks; the rest of the wave is a no-op until the LDS
+broadcast.
 
 ### 2.4 Distribute Mode
 
@@ -469,15 +468,24 @@ alpha-test, the across-pass ordering needs to match the host's submit
 order — same caveat that applies to any tile that is rendered more
 than once per frame.
 
-The wave-per-fine-tile rasterization decomposition from
-`streaming-pipeline-proposal.md` §2.7 applies inside `rasterize_tile`,
-optionally with the LDS-resident sub-tile claim pattern in §2.6 below.
+`rasterize_tile` subdivides the coarse bin into `W` fine sub-tiles
+(one per wave) and lets each wave rasterize its assigned sub-tile.
+This decomposition is the key to atomic-free framebuffer writes:
+each wave owns a disjoint pixel region, so depth tests, blends, and
+color writes need no cross-wave synchronization. Geometry table:
+
+| Wave size | W | Fine sub-tile | Coarse bin |
+|---|---|---|---|
+| 64 (GFX9; RDNA wave64 opt-in) | 4 | 16×16 (256 px, 4 passes) | 32×32 (1024 px) |
+| 32 (RDNA default) | 4 | 8×16 (128 px, 4 passes) | 16×32 (512 px) |
+
+§2.6 below describes both static (one wave per sub-tile) and dynamic
+(LDS-CAS-claimed) sub-tile assignment.
 
 ### 2.6 Within-WG Sub-Tile Ownership
 
 Inside `rasterize_tile`, the W waves can either statically partition
-fine sub-tiles (one wave per sub-tile, as in
-`streaming-pipeline-proposal.md` §2.7) or dynamically claim sub-tiles
+fine sub-tiles (one wave per sub-tile) or dynamically claim sub-tiles
 via LDS atomics:
 
 ```c
@@ -591,7 +599,7 @@ relationship with the previous releaser's writes to either pointer.
 |---|---|---|
 | spin | 256 | ~1 μs/pause × 256 ≈ 256 μs, comfortably above typical GPU drain |
 | yield | 32 | covers OS scheduler hiccups (sibling thread runs) |
-| sleep | unbounded | progressive 1 μs → 100 μs; bounded by watchdog (§8) |
+| sleep | unbounded | progressive 1 μs → 100 μs; bounded by watchdog (§7) |
 
 The `cpu_relax` hint matters. On x86 it tells the CPU to relax SMT
 scheduling (frees pipeline slots for the SMT sibling) and inserts a
@@ -613,11 +621,11 @@ Profiling can still distinguish them by counting partial pushes vs
 CAS misses; the streaming pipeline's instrumentation hooks (heartbeat
 counters per WG) extend naturally to host-side counters.
 
-#### Sharded variant (§7.7)
+#### Sharded variant (§6.7)
 
 If multiple host threads concurrently produce batches, the lock-based
 push above scales poorly: one host_queue_lock serializes all of them
-*and* every distributor WG. Sharded host queues (§7.7) give each
+*and* every distributor WG. Sharded host queues (§6.7) give each
 shard its own lock and slot range. A host thread picks a shard
 (round-robin or hashed by primitive id), tries the protocol above on
 that shard's lock, and falls back to the next shard on contention or
@@ -696,7 +704,7 @@ for (;;) {
 
 The cap matters: capping at ~2 μs keeps the WG responsive to new host
 pushes (which arrive at ≤ host queue latency, ~μs), and keeps total
-backoff time well under the watchdog threshold (§8, typically 1–10 ms).
+backoff time well under the watchdog threshold (§7.4, typically 1–10 ms).
 
 #### Where to call wg_backoff
 
@@ -725,8 +733,8 @@ work-broadcast and incur no additional backoff cost.
 - Kernel exit defeats the megakernel: re-dispatch costs μs of fence +
   scheduler overhead and loses LDS state. The whole point of
   persistent WGs is to avoid this loop.
-- `s_endpgm` only on the termination path (§8 inherited from
-  streaming-pipeline-proposal.md §2.8); never as a backoff.
+- `s_endpgm` only on the termination path (§7.1 termination); never
+  as a backoff.
 
 #### Comparison with host-side backoff
 
@@ -745,7 +753,7 @@ happens" primitive cheap enough to run in the megakernel. `s_sleep`
 maxes out at ~2 μs and the WG must re-poll. That's fine because the
 megakernel design assumes WGs are checking for work continuously
 anyway. Total time spent in backoff is bounded by the watchdog
-heartbeat threshold (§8); a WG that spends 100% of its time sleeping
+heartbeat threshold (§7.3); a WG that spends 100% of its time sleeping
 will eventually trip the watchdog because it never bumps its
 heartbeat counter — the heartbeat increment should happen only on
 productive iterations.
@@ -809,8 +817,10 @@ others to render only. Re-introduces a soft role split as a tuning
 hint, not a structural constraint. Distributor pool can be small (1–4
 WGs) since distribution is light per batch.
 
-If you go this far, the streaming proposal is probably the better
-design — it provides the same shape with cleaner semantics.
+Defeats the point of dynamic role selection, but useful as a
+diagnostic tool: if a fixed split outperforms the dynamic one,
+profiling will quickly show which side (distribute or render) is
+bottlenecking.
 
 ### 3.5 Recommendation
 
@@ -878,40 +888,14 @@ Stride-offset linear scan with `tile_pending` skip as baseline. Add
 workload-aware (4.2) only if profiling shows imbalance. Add Z-order
 (4.4) if memory bandwidth becomes the bottleneck.
 
-## 5. Comparison To Streaming Pipeline Proposal
-
-| Concern | Streaming (wave-disjoint) | Bin-ownership (this) |
-|---|---|---|
-| Distributor count | 1 WG (fixed) | Many WGs concurrent post-pop |
-| Pop serialization | None (single popper structurally) | `host_queue_lock` CAS, ~1 μs |
-| Host push contention | None (host SPSC) | Competes for `host_queue_lock` |
-| Tile queue producer | Single wave (structural) | WG holding `TILE_QLOCK` |
-| Tile queue consumer | Multi WG (SPMC, atomic on `front`) | WG holding `TILE_QLOCK` (drain phase) |
-| Tile queue mutual exclusion | None needed (single-producer + SPMC consumer) | Per-tile 3-state lock |
-| Concurrent push during rasterize | N/A | Yes (distributor + renderer overlap) |
-| Bin counter atomics | None | None |
-| Framebuffer atomics | None | None (per-tile renderer-exclusive) |
-| Per-iteration global atomics | Few (queue counters) | 1 CAS + 1 exch (host_q) + 2 CAS + 1 and (tile) |
-| Global queue model | SPSC (1 host, 1 wave 0) | Lock-shared (host or 1 WG holds at a time) |
-| Best regime | `B/N` moderate, balanced | `B/N >> 1`, variable, bursty |
-| Failure mode | Single-distributor cap binds | Pop CAS contention or renderer claim contention |
-| Implementation complexity | Lower | Higher |
-
-Both designs preserve "exactly one writer per tile queue at any moment"
-— wave-disjoint achieves it structurally, ownership-lock achieves it
-dynamically. The framebuffer is atomic-free in both.
-
-The two designs are not stackable. Choosing one means committing to its
-WG-loop structure.
-
-## 6. Memory Footprint
+## 5. Memory Footprint
 
 The pipeline's global memory cost is dominated by **per-tile queue state**.
 Everything else is fixed-overhead or scales with primitive count rather
 than tile count. Numbers below are at a 32-bit `tile_lock` and a 32-bit
-primitive-id queue entry; see §6.3 for sizing the queue capacity `C`.
+primitive-id queue entry; see §5.3 for sizing the queue capacity `C`.
 
-### 6.1 Per-Tile State
+### 5.1 Per-Tile State
 
 Each coarse tile carries a fixed-size record:
 
@@ -925,15 +909,15 @@ Each coarse tile carries a fixed-size record:
 | **Total** | **16 + 4·C** | VRAM |
 
 Each queue entry is a `uint32_t` primitive index; actual primitive
-screen-space data lives once in the streaming primitive store (§6.5),
+screen-space data lives once in the streaming primitive store (§5.5),
 not duplicated per tile.
 
 The tile arrays live in **device-local VRAM**, not fine-grained SVM:
 only GPU WGs touch them, the host never reads or writes. PCIe-coherent
 SVM is reserved for the host queue, the `terminate` flag, and the
-heartbeat counter (§6.5).
+heartbeat counter (§5.5).
 
-### 6.2 Total Tile-State Memory
+### 5.2 Total Tile-State Memory
 
 Tile count `B = ceil(W/T) × ceil(H/T)`:
 
@@ -961,7 +945,7 @@ All comfortably below 1% of an 8 GB GPU at any sane configuration. The
 4K 32×32 with C=1024 (32 MB) is the only entry approaching "noticeable",
 and still negligible against framebuffer + textures.
 
-### 6.3 Sizing C
+### 5.3 Sizing C
 
 Queue capacity needs to absorb the largest plausible burst between
 drains. Three regimes to consider:
@@ -992,7 +976,7 @@ Start at **C=256**. Profile queue-full events; drop to 128 if observed
 max depth stays well under, raise to 512 if overflow protection becomes
 a concern.
 
-### 6.4 Overflow Policy
+### 5.4 Overflow Policy
 
 When a tile queue is full, three choices with different memory cost:
 
@@ -1010,7 +994,7 @@ The bin-ownership proposal assumes (1) by default. If profiling shows
 distributor stalls on full queues are frequent, (2) is the natural
 extension.
 
-### 6.5 Other Memory Categories
+### 5.5 Other Memory Categories
 
 Independent of `B` and `C`, but required by the pipeline:
 
@@ -1029,10 +1013,11 @@ Fine-grained SVM total is under 5 MB even with a generous primitive
 store — important because fine-grained SVM atomics cross PCIe and are
 significantly more expensive than VRAM atomics.
 
-If the streaming proposal's HiZ extension is adopted, the per-tile
-`B × 8 B` is negligible (64 KB at 4K 32×32).
+If a hierarchical-Z extension is added (per-tile `(min, max)` depth
+in VRAM, used to skip primitives that fail the tile-Z test before
+binning), the per-tile `B × 8 B` is negligible (64 KB at 4K 32×32).
 
-### 6.6 Total Pipeline Footprint
+### 5.6 Total Pipeline Footprint
 
 Sum at the recommended **C=256** default:
 
@@ -1045,13 +1030,13 @@ Sum at the recommended **C=256** default:
 
 The framebuffer dominates at high resolutions; tile state is a small
 contribution. The `B/N ≥ 16` recommendation in §1 (favoring smaller
-tiles for fewer renderer-claim collisions, §7.2) costs only a few MB
+tiles for fewer renderer-claim collisions, §6.2) costs only a few MB
 of extra VRAM — there is no memory pressure to push toward larger
 tiles.
 
-## 7. Open Issues
+## 6. Open Issues
 
-### 7.1 Distributor Push Contention On Hot Tiles (Severity: low)
+### 6.1 Distributor Push Contention On Hot Tiles (Severity: low)
 
 The 3-state lock decouples push from rasterize, so distributors are
 *not* blocked on rasterization. They only contend with another
@@ -1063,11 +1048,11 @@ same bucket several times.
 
 Mitigations if profiling shows this matters:
 
-- Sharded host queues (§7.7) — multiple parallel distributors push to
+- Sharded host queues (§6.7) — multiple parallel distributors push to
   different shards in parallel.
 - Larger `B` — finer bins reduce per-bin push frequency.
 
-### 7.2 Renderer Claim Contention (Severity: medium)
+### 6.2 Renderer Claim Contention (Severity: medium)
 
 Other WGs that want to render a tile already in `TILE_RENDER` state
 fail their CAS (`render_try_acquire` requires fully UNLOCKED) and pick
@@ -1082,7 +1067,7 @@ TILE_RENDER hold time, so the population of "free" tiles cycles slowly.
 Mitigation: keep `B/N` large by sizing coarse bins small. Profile
 `render_try_acquire` failure rate; if > 5%, increase B.
 
-### 7.3 Distributor Starvation (Severity: low)
+### 6.3 Distributor Starvation (Severity: low)
 
 `host_queue_lock` is the single serialization point for popping
 batches. Multiple WGs can run `distribute_batch` concurrently after
@@ -1103,25 +1088,25 @@ Concrete failure modes:
 Crossing into tier 3 (sleep) regularly is the symptom that even with
 parallel distribute the GPU consumer cannot keep up — typically
 because individual `distribute_batch` calls are slow (large batches,
-hot tiles). Mitigations: sharded host queues (§7.7), larger batch
-size (fewer push round-trips per primitive), or move to the streaming
-proposal if the bottleneck is consistent.
+hot tiles). Mitigations: sharded host queues (§6.7), larger batch
+size (fewer push round-trips per primitive), or fall back to a
+fixed-role distributor pool (§3.4) if the bottleneck is consistent.
 
-### 7.4 Deadlock Avoidance (Severity: low)
+### 6.4 Deadlock Avoidance (Severity: low)
 
 Lock ordering rule (§2.2): distributor holds host_queue_lock then at
 most one tile_lock; renderer holds only tile_lock; no cycles. Trivially
 deadlock-free.
 
-### 7.5 Choosing B (Severity: high)
+### 6.5 Choosing B (Severity: high)
 
 `B` is the central tuning parameter:
 
 - Too small: renderers cannot find UNLOCKED tiles; `render_try_acquire`
-  CAS-failure rate climbs; effective parallelism collapses (§7.2).
+  CAS-failure rate climbs; effective parallelism collapses (§6.2).
 - Too large: per-pixel overhead from finer bin granularity, tile-state
   cache pressure, more queue traffic, larger `tile_lock[]` array (see
-  §6.2 for footprint at each B).
+  §5.2 for footprint at each B).
 
 Initial guidance:
 
@@ -1133,25 +1118,25 @@ Initial guidance:
 
 Profile lock contention and per-bin work distribution; tune. The
 memory cost of "more bins" is negligible at any sane resolution
-(§6.2), so the practical lower bound on T comes from §7.2 (renderer
+(§5.2), so the practical lower bound on T comes from §6.2 (renderer
 claim contention) rather than memory pressure.
 
-### 7.6 Fairness (Severity: low)
+### 6.6 Fairness (Severity: low)
 
 `atomicCAS` provides no fairness guarantee. In practice with persistent
 WGs, `B >> N`, and stride-offset hashing, all WGs make forward
 progress. If a future workload shows starvation, consider ticket locks.
 
-### 7.7 Sharded Host Queues (Severity: enhancement)
+### 6.7 Sharded Host Queues (Severity: enhancement)
 
 If one distributor cannot keep up with host production, shard the host
 queue into K parallel sub-queues, each with its own lock. Host writes
 to sub-queue `(prim_id % K)`. WGs claim a random sub-queue lock. Allows
 up to K parallel distributors at the cost of host-side push complexity.
 
-Worth implementing only if §7.3 measurably bites.
+Worth implementing only if §6.3 measurably bites.
 
-### 7.8 Lock Holder Eviction (Severity: low)
+### 6.8 Lock Holder Eviction (Severity: low)
 
 A WG that claims a lock and gets descheduled holds the lock
 indefinitely. With persistent megakernels and resident WGs (no
@@ -1159,7 +1144,7 @@ preemption mid-kernel on AMDGPU compute queues), this should not
 happen. If KFD ever introduces compute preemption, this design becomes
 fragile and would need a watchdog-based lock release.
 
-### 7.9 Frame Completion Detection (Severity: medium)
+### 6.9 Frame Completion Detection (Severity: medium)
 
 The pipeline as described does not yet specify how the host knows
 that all primitives of frame F have been rasterized so it can flip
@@ -1175,29 +1160,137 @@ points:
 - §2.7 (host push): host seals the frame by storing
   `frame_ack[F % N].expected = N_F` after pushing all batches.
 - Tile queue entry size grows from 4 B to 8 B (or pack `frame_id`
-  into high bits of `prim_id`); revisit §6.1 memory tables.
+  into high bits of `prim_id`); revisit §5.1 memory tables.
 
-## 8. Shared Infrastructure With Streaming Pipeline Proposal
+## 7. Persistence Infrastructure
 
-The following are unchanged from `streaming-pipeline-proposal.md` and
-are not re-described here:
+### 7.1 Termination
 
-- Megakernel + persistent WGs + oversubscribed launch with fast-exit
-  (§2.9 there).
-- Fine-grained coherent SVM allocation requirements.
-- Global `terminate` flag in fine-grained SVM.
-- Host watchdog (heartbeat counter).
-- KFD watchdog compatibility.
-- Wave size portability (compile wave64 across all archs as default).
-- `libkfd` extensions: async dispatch, fine-grained SVM, fence polling
-  with timeout, watchdog/priority controls.
+A single `terminate` flag in fine-grained SVM:
 
-The wave-level role within a WG (§2.3 there) — wave 0 polls + LDS
-broadcast + `s_barrier` — is also the same pattern, applied here to
-"pick mode" + "process under lock" rather than "pop a batch" +
-"distribute".
+```c
+atomic_uint32_t terminate;  // 0 == active, 1 == draining
+```
 
-## 9. Concrete Refinement (If Implemented)
+Host sequence at end of stream (app shutdown):
+
+1. Push the last real batch.
+2. Push an `END_OF_STREAM` batch *or* set `terminate = 1`. Either
+   works; `terminate = 1` is cheaper.
+3. Wait on the dispatch fence.
+
+Workgroup exit conditions:
+
+- Any WG that observes `terminate == 1` *and* finds no work in either
+  mode (host queue empty, no `tile_pending[t] > 0`) broadcasts an
+  exit signal via LDS, `s_barrier`s, all waves exit.
+
+The bin-queue-empty check after `terminate` ensures all rendering
+completes before exit. The distributor does not need to broadcast
+`END_OF_STREAM` into tile queues; the global flag is sufficient and
+avoids a fan-out write across all bins.
+
+For per-frame (rather than per-app) completion against this
+persistent megakernel, see `frame-completion-detection.md`. The
+`terminate` flag handles app shutdown only; per-frame ack is a
+separate counter mechanism.
+
+### 7.2 Oversubscribed Launch And Fast-Exit
+
+Launch `N` workgroups where `N > hardware_occupancy`. The hardware
+dispatcher fills CUs to capacity; the rest queue.
+
+In steady state only `hardware_occupancy` WGs run; the surplus is
+idle. When `terminate = 1` and resident WGs begin exiting, the
+queued surplus is admitted onto freed CUs. They run their loop once,
+observe `terminate`, exit on first iteration. This is the cleanup
+path that ensures every dispatched WG eventually completes, which is
+required for the dispatch fence to signal.
+
+Without oversubscription, persistent WGs that exited cleanly leave
+the CU idle until dispatch end. With oversubscription, the surplus
+drains the dispatch quickly. This is purely a fence-completion
+mechanism; it does not add steady-state parallelism.
+
+`N` should be sized so that surplus WGs do not blow out the PM4
+dispatch size. AMDGPU's grid limits are large; this is not a real
+constraint.
+
+### 7.3 Host Watchdog
+
+A heartbeat counter in fine-grained SVM, bumped by every WG on each
+*productive* iteration (work was found, not a backoff). The host
+periodically polls the heartbeat from a separate thread; if it has
+not advanced in `T` ms (typical: 1 s) the host concludes the GPU is
+hung and tears down via `kfd::ComputeQueue::reset()`.
+
+Iterations that go through the GPU backoff ladder (§2.8) deliberately
+do *not* bump the heartbeat — a fully idle pipeline (no host pushes,
+no tile work) has every WG sleeping in `s_sleep`, but the heartbeat
+stops advancing so the watchdog fires. To avoid false positives
+during legitimately quiet periods, the host can suspend the watchdog
+when it stops pushing (e.g., between frames in lockstep mode).
+
+### 7.4 KFD Watchdog Compatibility
+
+KFD has its own GPU-side watchdog that reset hangs the kernel after
+a threshold (typically 1–10 s, kernel-tunable). For a persistent
+megakernel that legitimately runs for the duration of an app, this
+threshold must be raised or the queue must be opted into a
+non-watchdog priority class. libkfd's `kfd::ComputeQueue` exposes
+the priority controls; the demo uses HIGH priority by default.
+
+### 7.5 Wave Size Portability
+
+`W` waves per WG and the per-wave fine-tile geometry interact with
+the target arch's wave size. AMDGPU GFX9 is wave64 only; GFX10/11/12
+(RDNA) defaults to wave32 in compute with wave64 available as opt-in.
+
+Three portability strategies:
+
+1. **Compile wave64 across the board**. Wastes lanes on RDNA's
+   scalar-heavy paths but keeps the WG/bin/tile geometry constant
+   across archs. Simplest. Default for the demo.
+2. **Per-arch `W` tuning**. The demo's CMake follows the
+   libkfd cross-compile-per-AMDGPU-arch pattern (see
+   `tools/computetoy` for an example); `W` and the fine-tile
+   geometry can be per-arch macros.
+3. **Hold coarse-bin pixel area constant**, let wave size dictate
+   fine-tile shape. Per-arch fine-tile geometry, per-arch coarse-bin
+   geometry. Most work to specify; preserves both wave occupancy
+   and cache behavior.
+
+The third is the most honest. The first is the right starting point.
+
+### 7.6 libkfd Extensions Required
+
+The current `libkfd::ComputeQueue` API is dispatch-then-wait. The
+persistent megakernel needs the host to keep producing into the SVM
+ring *while* the dispatch is in flight. Concretely:
+
+- **Async dispatch**: `kfd_gpu_dispatch_async(...)` returns
+  immediately with a fence handle the host can poll. Already
+  implementable as a thin wrapper over the existing PM4 submission
+  that does not call `kfd_gpu_fence_wait`.
+- **Fine-grained coherent SVM**. `libkfd::Memory` supports
+  fine-grained allocations; the demo needs the coherent
+  (no-explicit-flush) flag, both CPU and GPU pointer surfaced from
+  the same handle, and atomic-safe semantics validated on target
+  hardware.
+- **Fence polling with timeout**: `kfd_gpu_fence_wait_with_timeout`
+  so the host can interleave queue production with periodic fence
+  checks instead of blocking.
+- **Watchdog / priority control**: opt-in path to extended-priority
+  queues or disabled watchdog. KFD has the controls; libkfd needs
+  to expose them.
+- **Helper PM4 queue with `WAIT_REG_MEM` + `RELEASE_MEM`**: see
+  `frame-completion-detection.md` §5.8 for the interrupt-driven
+  host-wait pattern this enables.
+
+If any of these are already in libkfd, they need no work; this is a
+checklist for what the demo depends on.
+
+## 8. Concrete Refinement (If Implemented)
 
 The minimal shippable instantiation, in priority order:
 
@@ -1228,43 +1321,44 @@ The minimal shippable instantiation, in priority order:
    work.
 10. **Bin size**: 32×32 to start. 64×64 for 4K if `B/N ≥ 16` still
     holds. Avoid 128×128 unless `B/N ≥ 8` after measurement. Memory
-    footprint at each option is in §6.2; queue capacity sizing is in
-    §6.3.
-11. **Termination**: `terminate` flag in fine-grained SVM (per
-    `streaming-pipeline-proposal.md` §2.8).
-12. **Oversubscription and fast-exit**: as in
-    `streaming-pipeline-proposal.md` §2.9.
+    footprint at each option is in §5.2; queue capacity sizing is in
+    §5.3.
+11. **Termination**: `terminate` flag in fine-grained SVM (§7.1).
+12. **Oversubscription and fast-exit**: §7.2.
 13. **Host watchdog**: heartbeat counter; any WG can check on its
-    iteration.
+    iteration (§7.3).
+14. **libkfd extensions**: async dispatch + fine-grained SVM +
+    fence polling with timeout + helper PM4 queue for frame-end
+    interrupt (§7.6).
 
-## 10. Demo Staging
+## 9. Demo Staging
 
-The two proposals (this one and the streaming proposal) are not
-stackable. If both are implemented they live behind a runtime selector
-that picks based on `B/N`:
+A reasonable path for the rotating-teapot demo:
 
-- `B/N < 8` → streaming proposal.
-- `B/N ≥ 16` → bin-ownership.
-- `8 ≤ B/N < 16` → either; benchmark.
+1. **Stage 0: Single-shot upload + fixed kernel-per-frame.** Host
+   uploads the entire frame's primitives to VRAM, dispatches a
+   non-persistent megakernel that drains the upload, exits. Same
+   pipeline kernel as the final design but without the host↔GPU
+   ring or persistent loop. Fastest to a pixel-on-screen and
+   exercises the bin-ownership locks and 3-state per-tile
+   protocol.
+2. **Stage 1: Persistent megakernel with terminate flag.** Add the
+   `terminate` flag (§7.1) and oversubscription (§7.2). The
+   megakernel runs across multiple frames; per-frame completion
+   is gated on a separate counter (`frame-completion-detection.md`
+   §5).
+3. **Stage 2: Host↔GPU streaming ring.** Replace the upload with
+   a fine-grained-SVM ring that the host pushes to during frame N
+   while the GPU is rendering frame N (§2.7 host push protocol).
+   Earns the host-overlap-with-GPU benefit.
+4. **Stage 3: Interrupt-driven host wait.** Replace the polling
+   host wait with a helper PM4 queue (`frame-completion-detection.md`
+   §5.8). Frees the host CPU for non-rendering work.
 
-A reasonable demo path:
+Stages can be implemented in order; each is incrementally testable.
 
-1. Stand up the rotating-teapot demo against the streaming proposal
-   first (1080p, ~6 K triangles, B/N ≈ 6 at 64×64 — sweet spot for
-   the streaming shape).
-2. Once §2 of `streaming-pipeline-proposal.md` is working end-to-end,
-   crank tile size down to 32×32 (B/N ≈ 25) or scene density up
-   (subdivided teapot, particles) — the streaming distributor will
-   start to bottleneck. Switch to this proposal at that point.
-3. Cross-pollinate: both designs share `libkfd` extensions, the
-   wave-level intra-WG patterns, the host queue ABI, and the
-   frame-completion machinery (`frame-completion-detection.md`).
+## 10. Reading
 
-## 11. Reading
-
-- `streaming-pipeline-proposal.md` — the structurally-partitioned
-  alternative. Required reading for shared infrastructure (§8 of this
-  doc lists what carries over).
 - `cure-streaming-queues.md` — the queue primitive vocabulary,
   including the SPMC variant of `MultiIndexQueue`.
 - `frame-completion-detection.md` — host-side frame-end detection

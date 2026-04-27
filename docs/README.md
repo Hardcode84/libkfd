@@ -14,21 +14,19 @@ pipeline. None is implemented yet; they are the blueprint.
 
 1. `cure-streaming-queues.md` — vocabulary. Reference for the cuRE
    streaming-queue primitives (`MultiIndexQueue`, `ProgressQueue`)
-   that the two pipeline proposals borrow from. Read this first.
-2. `streaming-pipeline-proposal.md` — the **primary candidate
-   pipeline shape**. One distributor WG with wave-disjoint coarse-bin
-   partitioning; renderer WGs as multi-consumer of bin queues. Roles
-   are fixed at WG-launch time. Best fit when `B/N < 16`.
-3. `bin-ownership-pipeline-proposal.md` — **alternative pipeline
-   shape**. All WGs symmetric; each iteration picks distribute-mode
-   or render-mode dynamically via per-tile locks. Best fit when
-   `B/N ≥ 16` (denser scenes, smaller tiles, 4K).
-4. `frame-completion-detection.md` — orthogonal to the choice
-   between (2) and (3). How the host detects end-of-frame against a
-   *persistent* megakernel, since cuRE's "kernel-per-draw-call exit"
-   does not generalize. Recommends a bulk per-frame counter with
-   per-WG SGPR accumulator; documents both polling and KFD-signal
-   interrupt-driven host-wait paths.
+   that the pipeline proposal borrows from. Read this first.
+2. `bin-ownership-pipeline-proposal.md` — the **pipeline design**.
+   A persistent megakernel of `N` symmetric workgroups; each WG
+   picks distribute-mode (drain host queue, scatter primitives into
+   per-tile queues) or render-mode (drain a tile, rasterize) per
+   iteration via dynamic ownership locks. Single binary host queue
+   lock shared between host and GPU; 3-state per-tile locks that
+   let distributor pushes and renderer rasterizes overlap.
+3. `frame-completion-detection.md` — how the host detects
+   end-of-frame against a *persistent* megakernel, since cuRE's
+   "kernel-per-draw-call exit" does not generalize. Recommends a
+   bulk per-frame counter with per-WG SGPR accumulator; documents
+   both polling and KFD-signal interrupt-driven host-wait paths.
 
 ## What's Out Of Scope
 
@@ -54,8 +52,8 @@ cover:
   16×16), the unit of wave-level rasterization within a WG.
 - **B** — number of coarse bins covering the framebuffer.
 - **N** — number of resident WGs (≈ hardware occupancy).
-- **B/N** — design-determining ratio. Drives the choice between the
-  streaming and bin-ownership shapes.
+- **B/N** — design-determining ratio. The bin-ownership design is
+  robust at `B/N ≥ 16` and breaks down below `B/N < 4`.
 - **Megakernel** — a single long-running compute kernel that
   encapsulates all pipeline stages, contrasted with one
   kernel-per-stage.

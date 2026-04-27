@@ -377,7 +377,7 @@ Notes worth keeping in mind:
 ## 6. Porting Notes For AMDGPU + libkfd
 
 What carries over to an AMDGPU/libkfd implementation as proposed in
-`streaming-pipeline-proposal.md` and `bin-ownership-pipeline-proposal.md`:
+`bin-ownership-pipeline-proposal.md`:
 
 - **Slot-array bounded ring with sentinel values.** Direct port. Use
   `atomic_compare_exchange_strong` on the slot to swap `UNUSED ↔
@@ -405,8 +405,9 @@ What needs adaptation:
   `frame-completion-detection.md` for how the host detects
   per-frame completion without relying on kernel exit.
 - **Host↔GPU shared queues.** cuRE has no host-streamed queue (it
-  uploads the whole frame upfront). The streaming proposal adds one
-  via fine-grained SVM; see `streaming-pipeline-proposal.md` §2.2.
+  uploads the whole frame upfront). The bin-ownership proposal adds
+  one via fine-grained SVM; see
+  `bin-ownership-pipeline-proposal.md` §2.2.
 
 Relevant AMDGPU/libkfd background:
 
@@ -453,9 +454,9 @@ In priority order if any of this is to be ported:
 - `github.com/GPUPeople/cuRE`, MIT-licensed reference implementation. The
   files most worth reading are `index_queue.cuh`, `progress_queue.cuh`,
   `BinTileSpace.cuh`, and `BinTileRasterizationStage.cuh`.
-- `streaming-pipeline-proposal.md` and
-  `bin-ownership-pipeline-proposal.md` in this directory — the two
-  candidate AMDGPU/libkfd ports of the cuRE shape.
+- `bin-ownership-pipeline-proposal.md` in this directory — the
+  AMDGPU/libkfd port of the cuRE shape with dynamic per-WG role
+  selection and 3-state per-tile locks.
 - `frame-completion-detection.md` — how the host detects per-frame
   completion against a persistent megakernel, since cuRE's
   kernel-per-draw-call model does not generalize.
