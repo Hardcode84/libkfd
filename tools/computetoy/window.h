@@ -15,6 +15,12 @@
 #include <expected>
 #include <memory>
 
+enum class WindowBackend {
+  Auto,
+  Xcb,
+  Drm,
+};
+
 class Window {
 public:
   virtual ~Window() = default;
@@ -47,7 +53,8 @@ public:
 
   static std::expected<std::unique_ptr<Window>, kfd::Error>
   create(uint32_t width, uint32_t height, uint32_t num_buffers,
-         const char *title, int render_fd = -1);
+         const char *title, int render_fd = -1,
+         WindowBackend backend = WindowBackend::Auto);
 
 protected:
   Window(uint32_t w, uint32_t h) : w(w), h(h) {}

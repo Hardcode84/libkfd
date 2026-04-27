@@ -3,6 +3,7 @@ add_gpu_kernel(dispatch dispatch.c)
 add_gpu_kernel(memory memory.c)
 add_gpu_kernel(sync sync.c)
 add_gpu_kernel(preempt preempt.c)
+add_gpu_kernel(raster_demo raster_demo.c)
 add_gpu_kernel(preload_args preload_args.c
   "SHELL:-Xclang -target-feature"
   "SHELL:-Xclang +kernarg-preload"
