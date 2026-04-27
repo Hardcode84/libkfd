@@ -307,44 +307,78 @@ static void raster_subtile(const struct DemoPrimitive *prims,
   unsigned base_x = tile_x * tile_size + sub_x;
   unsigned base_y = tile_y * tile_size + sub_y;
 
-  for (unsigned p = lane; p < SUBTILE_PIXELS; p += 32u) {
-    unsigned x = base_x + (p % SUBTILE_WIDTH);
-    unsigned y = base_y + (p / SUBTILE_WIDTH);
-    if (x >= width || y >= height)
+  unsigned p0 = lane;
+  unsigned x0 = base_x + (p0 % SUBTILE_WIDTH);
+  unsigned y0 = base_y + (p0 / SUBTILE_WIDTH);
+  unsigned valid0 = x0 < width && y0 < height;
+  float px0 = (float)x0 + 0.5f;
+  float py0 = (float)y0 + 0.5f;
+  float best_depth0 = clear_depth;
+  unsigned best_color0 = clear_color;
+
+  unsigned p1 = lane + 32u;
+  unsigned x1 = base_x + (p1 % SUBTILE_WIDTH);
+  unsigned y1 = base_y + (p1 / SUBTILE_WIDTH);
+  unsigned valid1 = x1 < width && y1 < height;
+  float px1 = (float)x1 + 0.5f;
+  float py1 = (float)y1 + 0.5f;
+  float best_depth1 = clear_depth;
+  unsigned best_color1 = clear_color;
+
+  for (unsigned j = 0; j < range.count; ++j) {
+    unsigned i = tile_indices[range.offset + j];
+    struct DemoPrimitive tri = prims[i];
+    float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
+                      tri.v2.y);
+    if (area > -0.00001f && area < 0.00001f)
       continue;
 
-    float px = (float)x + 0.5f;
-    float py = (float)y + 0.5f;
-    float best_depth = clear_depth;
-    unsigned best_color = clear_color;
-
-    for (unsigned j = 0; j < range.count; ++j) {
-      unsigned i = tile_indices[range.offset + j];
-      struct DemoPrimitive tri = prims[i];
-      float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
-                        tri.v2.y);
-      if (area > -0.00001f && area < 0.00001f)
-        continue;
-
-      float w0 = edge(tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y, px, py) / area;
-      float w1 = edge(tri.v2.x, tri.v2.y, tri.v0.x, tri.v0.y, px, py) / area;
-      float w2 = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, px, py) / area;
-      if (w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f)
-        continue;
-
-      float z = w0 * tri.v0.z + w1 * tri.v1.z + w2 * tri.v2.z;
-      if (z < 0.0f || z > best_depth)
-        continue;
-
-      float u = w0 * tri.v0.u + w1 * tri.v1.u + w2 * tri.v2.u;
-      float v = w0 * tri.v0.v + w1 * tri.v1.v + w2 * tri.v2.v;
-      best_depth = z;
-      best_color = shade_checker(u, v);
+    float inv_area = 1.0f / area;
+    if (valid0) {
+      float w0 =
+          edge(tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y, px0, py0) * inv_area;
+      float w1 =
+          edge(tri.v2.x, tri.v2.y, tri.v0.x, tri.v0.y, px0, py0) * inv_area;
+      float w2 =
+          edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, px0, py0) * inv_area;
+      if (w0 >= -0.0001f && w1 >= -0.0001f && w2 >= -0.0001f) {
+        float z = w0 * tri.v0.z + w1 * tri.v1.z + w2 * tri.v2.z;
+        if (z >= 0.0f && z <= best_depth0) {
+          float u = w0 * tri.v0.u + w1 * tri.v1.u + w2 * tri.v2.u;
+          float v = w0 * tri.v0.v + w1 * tri.v1.v + w2 * tri.v2.v;
+          best_depth0 = z;
+          best_color0 = shade_checker(u, v);
+        }
+      }
     }
+    if (valid1) {
+      float w0 =
+          edge(tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y, px1, py1) * inv_area;
+      float w1 =
+          edge(tri.v2.x, tri.v2.y, tri.v0.x, tri.v0.y, px1, py1) * inv_area;
+      float w2 =
+          edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, px1, py1) * inv_area;
+      if (w0 >= -0.0001f && w1 >= -0.0001f && w2 >= -0.0001f) {
+        float z = w0 * tri.v0.z + w1 * tri.v1.z + w2 * tri.v2.z;
+        if (z >= 0.0f && z <= best_depth1) {
+          float u = w0 * tri.v0.u + w1 * tri.v1.u + w2 * tri.v2.u;
+          float v = w0 * tri.v0.v + w1 * tri.v1.v + w2 * tri.v2.v;
+          best_depth1 = z;
+          best_color1 = shade_checker(u, v);
+        }
+      }
+    }
+  }
 
-    unsigned idx = y * pitch + x;
-    depth[idx] = best_depth;
-    color[idx] = best_color;
+  if (valid0) {
+    unsigned idx = y0 * pitch + x0;
+    depth[idx] = best_depth0;
+    color[idx] = best_color0;
+  }
+  if (valid1) {
+    unsigned idx = y1 * pitch + x1;
+    depth[idx] = best_depth1;
+    color[idx] = best_color1;
   }
 }
 
