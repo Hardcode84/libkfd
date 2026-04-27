@@ -899,6 +899,9 @@ when measurements justify the helper-queue plumbing.
   this proposal layers on top.
 - `bin-ownership-pipeline-proposal.md` §7.1 — `terminate` flag
   (app-shutdown, not per-frame).
+- `headless-testing.md` §3.4 — frame-completion test cases that
+  validate this protocol (empty frames, one-primitive frames,
+  frame straddling host backoff).
 - `include/libkfd/event.h` — KFD event RAII wrapper used by §5.8.
 - `include/libkfd/signal.h` — `Signal::wait(spin_then_block)` used by
   §5.8.

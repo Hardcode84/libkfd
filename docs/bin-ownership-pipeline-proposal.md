@@ -518,6 +518,40 @@ claimed sub-tile exclusively, the same property as the streaming
 proposal's static wave-per-fine-tile assignment, but with dynamic load
 balance.
 
+#### 2.6.1 Per-Pixel Work: Demo Shader
+
+Inside `rasterize_subtile`, each lane owns one pixel for one pass and
+performs the standard inner loop: edge tests against the triangle's
+half-spaces, depth interpolation, depth test, then the pixel shader.
+
+The demo's shader is a **procedural checkerboard** sampled against
+interpolated `(u, v)` — no texture memory, no sampler state, no cache
+pressure. Closed-form:
+
+```c
+__device__ uint32_t shade_checker(float u, float v) {
+  // 1.0 of UV maps to 8 checker cells. Adjust scale per object.
+  uint32_t iu = (uint32_t)floorf(u * 8.0f);
+  uint32_t iv = (uint32_t)floorf(v * 8.0f);
+  return ((iu ^ iv) & 1u) ? 0xffe0e0e0u  // light cell
+                          : 0xff202020u; // dark cell
+}
+```
+
+UV is supplied per-vertex by the host (planar projection onto the
+teapot is fine for the demo) and stored alongside screen-space
+position in the primitive store (§5.5). The rasterizer interpolates
+UV barycentrically across the triangle. **Affine** interpolation is
+the starting point; perspective-correct (`u/w`, `v/w`, `1/w`) is a
+small extension that doesn't change the pipeline shape.
+
+This split — procedural shader on top of a real binning/rasterization
+pipeline — exercises the UV interpolation and per-pixel hook points
+that any future texture-sampler implementation will plug into,
+without coupling the demo to a texture cache, sampler descriptors,
+or LOD selection. The demo replaces `shade_checker` with a real
+sampled lookup later; nothing else in the pipeline changes.
+
 ### 2.7 Host-Side Push Protocol
 
 The host walks the scene, builds batches in fine-grained SVM, and
@@ -1001,7 +1035,7 @@ Independent of `B` and `C`, but required by the pipeline:
 | Buffer | Sizing | Where |
 |---|---|---|
 | Host queue (batch ring) | 256 batches × ~256 B header ≈ 64 KB | fine SVM |
-| Primitive store | P_max × ~64 B; 50K × 64 B = 3.2 MB | fine SVM |
+| Primitive store | P_max × ~96 B; 50K × 96 B = 4.8 MB | fine SVM |
 | `host_queue_lock` | 4 B | fine SVM |
 | `terminate` flag | 4 B | fine SVM |
 | Heartbeat counter | 4 B | fine SVM |
@@ -1009,9 +1043,22 @@ Independent of `B` and `C`, but required by the pipeline:
 | Framebuffer (color + depth) | W·H · 8 B | VRAM |
 | LDS scratch (per WG) | ~16 KB / WG | LDS (on-chip) |
 
-Fine-grained SVM total is under 5 MB even with a generous primitive
+The primitive entry packs three vertex records of `(x, y, z, u, v)`
+in screen space (5 × 4 B = 20 B per vertex; 60 B per triangle), plus
+a small header (material id, flags, padding) — call it 96 B per
+triangle to leave headroom. Adding perspective-correct interpolation
+later costs one extra `1/w` per vertex (4 B), still well under
+the 128-B alignment.
+
+Fine-grained SVM total is under ~6 MB even with a generous primitive
 store — important because fine-grained SVM atomics cross PCIe and are
 significantly more expensive than VRAM atomics.
+
+The procedural checker (§2.6.1) is closed-form — **no texture
+allocation in fine SVM or VRAM**. A real sampled-texture extension
+would add the texture data in VRAM (typical demo texture: 256×256 ×
+4 B = 256 KB) and is read-only, so it does not interact with the
+locking protocol.
 
 If a hierarchical-Z extension is added (per-tile `(min, max)` depth
 in VRAM, used to skip primitives that fail the tile-Z test before
@@ -1023,10 +1070,10 @@ Sum at the recommended **C=256** default:
 
 | Resolution | Tile | Tile state | Other (fine SVM) | Other (VRAM, FB) | Total |
 |---|---|---|---|---|---|
-| 1080p | 32 | 2.02 MB | ~3.5 MB | ~16 MB | ~22 MB |
-| 1440p | 32 | 3.57 MB | ~3.5 MB | ~28 MB | ~35 MB |
-| 4K | 32 | 8.09 MB | ~3.5 MB | ~63 MB | ~75 MB |
-| 4K | 64 | 2.02 MB | ~3.5 MB | ~63 MB | ~69 MB |
+| 1080p | 32 | 2.02 MB | ~5.1 MB | ~16 MB | ~23 MB |
+| 1440p | 32 | 3.57 MB | ~5.1 MB | ~28 MB | ~37 MB |
+| 4K | 32 | 8.09 MB | ~5.1 MB | ~63 MB | ~76 MB |
+| 4K | 64 | 2.02 MB | ~5.1 MB | ~63 MB | ~70 MB |
 
 The framebuffer dominates at high resolutions; tile state is a small
 contribution. The `B/N ≥ 16` recommendation in §1 (favoring smaller
@@ -1333,24 +1380,36 @@ The minimal shippable instantiation, in priority order:
 
 ## 9. Demo Staging
 
-A reasonable path for the rotating-teapot demo:
+Every stage runs **headless first** — `headless_runner` reads the
+framebuffer back to host memory and validates against goldens or
+invariants (`headless-testing.md`). The windowed dma-buf
+swapchain mode is enabled at the end of stage 1 once frame
+completion lands; until then there is nothing to flip on a vsync
+boundary. Adopting this order means each stage has its own CI
+test before any presentation code exists.
 
 1. **Stage 0: Single-shot upload + fixed kernel-per-frame.** Host
    uploads the entire frame's primitives to VRAM, dispatches a
    non-persistent megakernel that drains the upload, exits. Same
    pipeline kernel as the final design but without the host↔GPU
-   ring or persistent loop. Fastest to a pixel-on-screen and
-   exercises the bin-ownership locks and 3-state per-tile
-   protocol.
+   ring or persistent loop. Fastest to a pixel-on-screen
+   (headless) and exercises the bin-ownership locks and 3-state
+   per-tile protocol. Validated by pixel-equality + invariant
+   tests (`headless-testing.md` §3.1, §3.2).
 2. **Stage 1: Persistent megakernel with terminate flag.** Add the
    `terminate` flag (§7.1) and oversubscription (§7.2). The
    megakernel runs across multiple frames; per-frame completion
    is gated on a separate counter (`frame-completion-detection.md`
-   §5).
+   §5). Validated by frame-completion + termination tests
+   (`headless-testing.md` §3.4, §3.5). Windowed mode (dma-buf
+   swapchain flip) lands here, replacing the readback path with
+   a present.
 3. **Stage 2: Host↔GPU streaming ring.** Replace the upload with
    a fine-grained-SVM ring that the host pushes to during frame N
    while the GPU is rendering frame N (§2.7 host push protocol).
-   Earns the host-overlap-with-GPU benefit.
+   Earns the host-overlap-with-GPU benefit. Validated by
+   concurrency stress tests (`headless-testing.md` §3.3) — the
+   `host_queue_lock` contention path now has real load.
 4. **Stage 3: Interrupt-driven host wait.** Replace the polling
    host wait with a helper PM4 queue (`frame-completion-detection.md`
    §5.8). Frees the host CPU for non-rendering work.
@@ -1363,6 +1422,8 @@ Stages can be implemented in order; each is incrementally testable.
   including the SPMC variant of `MultiIndexQueue`.
 - `frame-completion-detection.md` — host-side frame-end detection
   and KFD-signal-driven wait, complementary to this proposal.
+- `headless-testing.md` — test harness shape, test categories,
+  and the windowless validation path used by every demo stage.
 - Kenzel, Kerbl, Steinberger, Schmalstieg, *A High-Performance
   Software Graphics Pipeline Architecture for the GPU*, SIGGRAPH
   2018. The cuRE paper; the streaming-queue primitive vocabulary
