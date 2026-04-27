@@ -23,12 +23,18 @@ pipeline. None is implemented yet; they are the blueprint.
    iteration via dynamic ownership locks. Single binary host queue
    lock shared between host and GPU; 3-state per-tile locks that
    let distributor pushes and renderer rasterizes overlap.
-3. `frame-completion-detection.md` — how the host detects
+3. `active-tile-queue-handoff.md` — a refinement to renderer work
+   discovery and frame handoff. Distributors append populated tile
+   IDs to an active tile queue; renderers pop that queue instead of
+   scanning all tile queues. The note also sketches EOF/drain
+   predicates for non-cooperative completion and future cooperative
+   grid-barrier handoff.
+4. `frame-completion-detection.md` — how the host detects
    end-of-frame against a *persistent* megakernel, since cuRE's
    "kernel-per-draw-call exit" does not generalize. Recommends a
    bulk per-frame counter with per-WG SGPR accumulator; documents
    both polling and KFD-signal interrupt-driven host-wait paths.
-4. `headless-testing.md` — running the kernel in CI / on a
+5. `headless-testing.md` — running the kernel in CI / on a
    display-less dev box. Same kernel binary as the windowed demo;
    readback replaces flip. Defines test categories (pixel-equality,
    invariants, concurrency stress, frame-completion, termination,
