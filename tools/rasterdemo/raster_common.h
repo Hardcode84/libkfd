@@ -65,18 +65,18 @@ typedef struct RasterArgs {
 } RasterArgs;
 
 typedef struct PersistentControl {
-  volatile unsigned terminate;
-  volatile unsigned current_epoch;
-  volatile unsigned active_cursor;
-  volatile unsigned completed_wgs;
+  unsigned terminate;
+  unsigned current_epoch;
+  unsigned active_cursor;
+  unsigned completed_wgs;
 } PersistentControl;
 
 typedef struct ClaimFrameArgs {
   const DemoPrimitive *prims;
   const unsigned *tile_indices;
   const TileRange *tile_ranges;
-  const volatile unsigned *active_tiles;
-  volatile unsigned *active_cursor;
+  const unsigned *active_tiles;
+  unsigned *active_cursor;
   unsigned *color;
   float *depth;
   unsigned width;
@@ -96,7 +96,7 @@ typedef struct PersistentArgs {
   const DemoPrimitive *prims;
   const unsigned *tile_indices;
   const TileRange *tile_ranges;
-  const volatile unsigned *active_tiles;
+  const unsigned *active_tiles;
   unsigned *color;
   float *depth;
   unsigned width;

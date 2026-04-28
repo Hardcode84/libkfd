@@ -6,7 +6,7 @@ struct PersistentFrame {
   const struct DemoPrimitive *prims;
   const unsigned *tile_indices;
   const struct TileRange *tile_ranges;
-  const volatile unsigned *active_tiles;
+  const unsigned *active_tiles;
   unsigned *color;
   float *depth;
   unsigned width;
@@ -21,15 +21,15 @@ struct PersistentFrame {
 };
 
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_claimed_tile;
+static __gpu_local unsigned lds_claimed_tile;
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_tile_range_offset;
+static __gpu_local unsigned lds_tile_range_offset;
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_tile_range_count;
+static __gpu_local unsigned lds_tile_range_count;
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_current_epoch;
+static __gpu_local unsigned lds_current_epoch;
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_terminate;
+static __gpu_local unsigned lds_terminate;
 
 static float edge(float ax, float ay, float bx, float by, float px, float py) {
   return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
@@ -41,8 +41,7 @@ static unsigned shade_checker(float u, float v) {
   return ((iu ^ iv) & 1u) ? 0xffe0e0e0u : 0xff202020u;
 }
 
-static unsigned pop_active_tile(volatile unsigned *cursor,
-                                const volatile unsigned *active_tiles,
+static unsigned pop_active_tile(unsigned *cursor, const unsigned *active_tiles,
                                 unsigned active_count) {
   unsigned index = __atomic_fetch_add(cursor, 1u, __ATOMIC_ACQ_REL);
   if (index >= active_count)
