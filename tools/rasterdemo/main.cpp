@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,8 @@ public:
           std::free(event);
           return false;
         }
+        if (kp->detail == /*Space=*/65)
+          pause_toggle = true;
         break;
       }
       case XCB_CLIENT_MESSAGE: {
@@ -166,6 +169,8 @@ public:
     }
     return !xcb_connection_has_error(conn);
   }
+
+  bool take_pause_toggle() { return std::exchange(pause_toggle, false); }
 
   void present(const uint32_t *pixels, uint32_t pitch) {
     scratch.resize(static_cast<size_t>(w) * h);
@@ -219,6 +224,7 @@ private:
   uint32_t h = 0;
   uint8_t depth = 0;
   std::vector<uint32_t> scratch;
+  bool pause_toggle = false;
 };
 #endif
 
@@ -827,9 +833,12 @@ int main(int argc, char **argv) {
   auto start = std::chrono::steady_clock::now();
   auto fps_time = start;
   uint32_t fps_frames = 0;
+  bool render_paused = false;
 
-  std::printf("Rendering %u triangles at %ux%u. Press q or Esc to quit.\n",
-              RINGS * SLICES * 2, width, height);
+  std::printf(
+      "Rendering %u triangles at %ux%u. Press Space to pause/resume, q or Esc "
+      "to quit.\n",
+      RINGS * SLICES * 2, width, height);
   uint64_t gpu_timeout_ns = static_cast<uint64_t>(gpu_timeout_ms) * 1'000'000u;
 
   for (;;) {
@@ -843,6 +852,27 @@ int main(int argc, char **argv) {
                        : win->poll();
     if (!running)
       break;
+
+    bool pause_toggled = false;
+    if (!headless) {
+      if (software_present) {
+#ifdef HAVE_RASTERDEMO_XCB_SW
+        pause_toggled = sw_win->take_pause_toggle();
+#endif
+      } else {
+        pause_toggled = win->take_pause_toggle();
+      }
+    }
+    if (pause_toggled) {
+      render_paused = !render_paused;
+      std::printf("Rendering %s.\n", render_paused ? "paused" : "resumed");
+      fps_frames = 0;
+      fps_time = std::chrono::steady_clock::now();
+    }
+    if (render_paused) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
 
     if (!software_present && !headless)
       win->wait_idle(current);

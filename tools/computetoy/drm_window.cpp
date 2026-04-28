@@ -379,8 +379,8 @@ public:
         saved_tty(o.saved_tty), num_buffers(o.num_buffers),
         fb_ids(std::move(o.fb_ids)), gem_handles(std::move(o.gem_handles)),
         displaying(o.displaying), pending(o.pending), ready(o.ready),
-        mode_set(o.mode_set), quit(o.quit), vblank_interval(o.vblank_interval) {
-  }
+        mode_set(o.mode_set), quit(o.quit), pause_toggle(o.pause_toggle),
+        vblank_interval(o.vblank_interval) {}
 
   std::expected<void, kfd::Error> import_buffer(uint32_t index, int dmabuf_fd,
                                                 size_t /*size*/,
@@ -416,9 +416,15 @@ public:
           quit = true;
           return false;
         }
+        if (c == ' ')
+          pause_toggle = true;
       }
     }
     return true;
+  }
+
+  bool take_pause_toggle() override {
+    return std::exchange(pause_toggle, false);
   }
 
   void wait_idle(uint32_t index) override {
@@ -566,6 +572,7 @@ private:
   int32_t ready = -1;
   bool mode_set = false;
   bool quit = false;
+  bool pause_toggle = false;
   double vblank_interval = 0.0;
 };
 

@@ -68,7 +68,7 @@ public:
         present_special(std::exchange(o.present_special, nullptr)),
         depth(o.depth), num_buffers(o.num_buffers),
         pixmaps(std::move(o.pixmaps)), busy(std::move(o.busy)),
-        last_msc(o.last_msc) {}
+        last_msc(o.last_msc), pause_toggle(o.pause_toggle) {}
 
   std::expected<void, kfd::Error> import_buffer(uint32_t index, int dmabuf_fd,
                                                 size_t size,
@@ -113,6 +113,8 @@ public:
           std::free(event);
           return false;
         }
+        if (kp->detail == /*Space=*/65)
+          pause_toggle = true;
         break;
       }
       case XCB_CLIENT_MESSAGE: {
@@ -129,6 +131,10 @@ public:
       std::free(event);
     }
     return !xcb_connection_has_error(conn);
+  }
+
+  bool take_pause_toggle() override {
+    return std::exchange(pause_toggle, false);
   }
 
   void wait_idle(uint32_t index) override {
@@ -194,6 +200,7 @@ private:
   std::unique_ptr<xcb_pixmap_t[]> pixmaps;
   std::unique_ptr<bool[]> busy;
   uint64_t last_msc = 0;
+  bool pause_toggle = false;
 };
 
 std::expected<XCBWindow, kfd::Error> XCBWindow::create(uint32_t width,

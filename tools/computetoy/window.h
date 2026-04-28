@@ -38,6 +38,9 @@ public:
   // Poll for input events. Returns false when the session should end.
   virtual bool poll() = 0;
 
+  // Returns true once for each pause/resume input event consumed by poll().
+  virtual bool take_pause_toggle() { return false; }
+
   // Block until the given buffer is no longer in use by the display.
   virtual void wait_idle(uint32_t index) = 0;
 
