@@ -422,10 +422,13 @@ __gpu_kernel void rasterdemo_frame(struct RasterArgs args) {
               args.clear_color, args.clear_depth, tile_x, tile_y);
 }
 
+static unsigned linear_id() {
+  return __gpu_thread_id_x() + __gpu_thread_id_y() * __gpu_num_threads_x() +
+         __gpu_thread_id_z() * __gpu_num_threads_x() * __gpu_num_threads_y();
+}
+
 __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
-  unsigned tid =
-      __gpu_thread_id_x() + __gpu_thread_id_y() * __gpu_num_threads_x() +
-      __gpu_thread_id_z() * __gpu_num_threads_x() * __gpu_num_threads_y();
+  unsigned tid = linear_id();
 
   for (;;) {
     if (tid == 0)
@@ -465,9 +468,7 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
 __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
   struct PersistentArgs args = *launch.args;
   unsigned seen_epoch = 0;
-  unsigned tid =
-      __gpu_thread_id_x() + __gpu_thread_id_y() * __gpu_num_threads_x() +
-      __gpu_thread_id_z() * __gpu_num_threads_x() * __gpu_num_threads_y();
+  unsigned tid = linear_id();
 
   for (;;) {
     if (tid == 0) {
@@ -558,8 +559,7 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                             f.clear_only, tid);
       __gpu_sync_threads();
 
-      if (__gpu_thread_id_x() == 0 && __gpu_thread_id_y() == 0 &&
-          __gpu_thread_id_z() == 0) {
+      if (tid == 0) {
         __atomic_fetch_add(&args.control->render_done, 1u, __ATOMIC_ACQ_REL);
         lds_frame_closed =
             try_complete_epoch(args.control, epoch, active_count);
