@@ -78,7 +78,6 @@ struct PersistentControl {
   volatile unsigned sealed_epoch;
   volatile unsigned closing_epoch;
   volatile unsigned completed_epoch;
-  volatile unsigned active_slot;
   volatile unsigned active_cursor;
   volatile unsigned active_count;
   volatile unsigned render_done;
@@ -89,12 +88,8 @@ struct PersistentArgs {
   const struct DemoPrimitive *prims;
   const unsigned *tile_indices;
   const struct TileRange *tile_ranges;
-  const volatile unsigned *active_tiles0;
-  const volatile unsigned *active_tiles1;
-  const volatile unsigned *active_tiles2;
-  unsigned *color0;
-  unsigned *color1;
-  unsigned *color2;
+  const volatile unsigned *active_tiles;
+  unsigned *color;
   float *depth;
   unsigned width;
   unsigned height;
@@ -466,16 +461,15 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
 }
 
 __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
-  struct PersistentArgs args = *launch.args;
+  struct PersistentControl *control = launch.args->control;
   unsigned seen_epoch = 0;
   unsigned tid = linear_id();
 
   for (;;) {
     if (tid == 0) {
-      lds_terminate =
-          __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
+      lds_terminate = __atomic_load_n(&control->terminate, __ATOMIC_ACQUIRE);
       lds_current_epoch =
-          __atomic_load_n(&args.control->current_epoch, __ATOMIC_ACQUIRE);
+          __atomic_load_n(&control->current_epoch, __ATOMIC_ACQUIRE);
     }
     __gpu_sync_threads();
 
@@ -488,16 +482,13 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       continue;
     }
 
-    unsigned slot =
-        __atomic_load_n(&args.control->active_slot, __ATOMIC_ACQUIRE);
+    struct PersistentArgs args = *launch.args;
     struct PersistentFrame f;
     f.prims = args.prims;
     f.tile_indices = args.tile_indices;
     f.tile_ranges = args.tile_ranges;
-    f.active_tiles = slot == 0   ? args.active_tiles0
-                     : slot == 1 ? args.active_tiles1
-                                 : args.active_tiles2;
-    f.color = slot == 0 ? args.color0 : slot == 1 ? args.color1 : args.color2;
+    f.active_tiles = args.active_tiles;
+    f.color = args.color;
     f.depth = args.depth;
     f.width = args.width;
     f.height = args.height;
@@ -509,19 +500,18 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     f.clear_depth = args.clear_depth;
     f.clear_only = args.clear_only;
     unsigned active_count =
-        __atomic_load_n(&args.control->active_count, __ATOMIC_ACQUIRE);
+        __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE);
 
     for (;;) {
       if (tid == 0)
-        lds_claimed_tile = pop_active_tile(&args.control->active_cursor,
+        lds_claimed_tile = pop_active_tile(&control->active_cursor,
                                            f.active_tiles, active_count);
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
       if (tile == 0xffffffffu) {
         for (;;) {
           if (tid == 0) {
-            lds_frame_closed =
-                try_complete_epoch(args.control, epoch, active_count);
+            lds_frame_closed = try_complete_epoch(control, epoch, active_count);
           }
           __gpu_sync_threads();
           if (lds_frame_closed)
@@ -549,9 +539,8 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       __gpu_sync_threads();
 
       if (tid == 0) {
-        __atomic_fetch_add(&args.control->render_done, 1u, __ATOMIC_ACQ_REL);
-        lds_frame_closed =
-            try_complete_epoch(args.control, epoch, active_count);
+        __atomic_fetch_add(&control->render_done, 1u, __ATOMIC_ACQ_REL);
+        lds_frame_closed = try_complete_epoch(control, epoch, active_count);
       }
       __gpu_sync_threads();
       if (lds_frame_closed)

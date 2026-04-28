@@ -90,7 +90,6 @@ struct PersistentControl {
   uint32_t sealed_epoch;
   uint32_t closing_epoch;
   uint32_t completed_epoch;
-  uint32_t active_slot;
   uint32_t active_cursor;
   uint32_t active_count;
   uint32_t render_done;
@@ -121,12 +120,8 @@ struct PersistentArgs {
   const DemoPrimitive *prims;
   const uint32_t *tile_indices;
   const TileRange *tile_ranges;
-  const uint32_t *active_tiles0;
-  const uint32_t *active_tiles1;
-  const uint32_t *active_tiles2;
-  uint32_t *color0;
-  uint32_t *color1;
-  uint32_t *color2;
+  const uint32_t *active_tiles;
+  uint32_t *color;
   float *depth;
   uint32_t width;
   uint32_t height;
@@ -158,7 +153,6 @@ static const DemoBinary rasterdemo_kernels[] = {
 
 struct Framebuffer {
   kfd::Buffer color;
-  kfd::Buffer active_tiles;
   kfd::Buffer active_cursor;
   kfd::DMABuffer dmabuf;
   kfd::Buffer kernarg;
@@ -834,6 +828,15 @@ int main(int argc, char **argv) {
       dev, kfd::detail::align_up(tile_ranges_bytes, kfd::detail::page_size()),
       kfd::MemType::GTT, HOST_GTT_FLAGS));
   KFD_EXPECT(tile_ranges_buf.map(dev));
+  auto active_tiles_buf = KFD_EXPECT(kfd::Buffer::allocate(
+      dev, kfd::detail::align_up(active_tiles_bytes, kfd::detail::page_size()),
+      kfd::MemType::GTT, HOST_GTT_FLAGS));
+  KFD_EXPECT(active_tiles_buf.map(dev));
+  auto *active_tiles = static_cast<uint32_t *>(active_tiles_buf.data());
+  // The current demo clears as part of tile rendering, so every tile remains
+  // active until clearing is split into its own pass.
+  for (uint32_t tile = 0; tile < tile_count; ++tile)
+    active_tiles[tile] = tile;
   std::vector<TileRange> tile_ranges;
   std::vector<uint32_t> tile_indices;
 
@@ -851,16 +854,6 @@ int main(int argc, char **argv) {
     fbs[i].color = KFD_EXPECT(
         kfd::Buffer::allocate(dev, color_bytes, color_type, color_flags));
     KFD_EXPECT(fbs[i].color.map(dev));
-    fbs[i].active_tiles = KFD_EXPECT(kfd::Buffer::allocate(
-        dev,
-        kfd::detail::align_up(active_tiles_bytes, kfd::detail::page_size()),
-        kfd::MemType::GTT, HOST_GTT_FLAGS));
-    KFD_EXPECT(fbs[i].active_tiles.map(dev));
-    auto *active_tiles = static_cast<uint32_t *>(fbs[i].active_tiles.data());
-    // The current demo clears as part of tile rendering, so every tile remains
-    // active until clearing is split into its own pass.
-    for (uint32_t tile = 0; tile < tile_count; ++tile)
-      active_tiles[tile] = tile;
     fbs[i].active_cursor = KFD_EXPECT(kfd::Buffer::allocate(
         dev, kfd::detail::page_size(), kfd::MemType::GTT, HOST_GTT_FLAGS));
     KFD_EXPECT(fbs[i].active_cursor.map(dev));
@@ -900,15 +893,8 @@ int main(int argc, char **argv) {
       .prims = static_cast<const DemoPrimitive *>(prim_buf.data()),
       .tile_indices = static_cast<const uint32_t *>(tile_indices_buf.data()),
       .tile_ranges = static_cast<const TileRange *>(tile_ranges_buf.data()),
-      .active_tiles0 =
-          static_cast<const uint32_t *>(fbs[0].active_tiles.data()),
-      .active_tiles1 =
-          static_cast<const uint32_t *>(fbs[1].active_tiles.data()),
-      .active_tiles2 =
-          static_cast<const uint32_t *>(fbs[2].active_tiles.data()),
-      .color0 = static_cast<uint32_t *>(fbs[0].color.data()),
-      .color1 = static_cast<uint32_t *>(fbs[1].color.data()),
-      .color2 = static_cast<uint32_t *>(fbs[2].color.data()),
+      .active_tiles = static_cast<const uint32_t *>(active_tiles_buf.data()),
+      .color = static_cast<uint32_t *>(fbs[0].color.data()),
       .depth = static_cast<float *>(depth.data()),
       .width = width,
       .height = height,
@@ -927,8 +913,10 @@ int main(int argc, char **argv) {
   KFD_EXPECT(persistent_args_buf.map(dev));
   std::memcpy(persistent_args_buf.data(), &persistent_args,
               sizeof(persistent_args));
+  auto *persistent_args_device =
+      static_cast<PersistentArgs *>(persistent_args_buf.data());
   PersistentLaunchArgs persistent_launch{
-      .args = static_cast<const PersistentArgs *>(persistent_args_buf.data()),
+      .args = persistent_args_device,
   };
   persistent_kernel.fill(persistent_kernarg, persistent_launch, persistent_cfg);
   auto shutdown_signal = KFD_EXPECT(kfd::Signal::create(ctx));
@@ -1029,7 +1017,7 @@ int main(int argc, char **argv) {
           .tile_indices = args.tile_indices,
           .tile_ranges = args.tile_ranges,
           .active_tiles =
-              static_cast<const uint32_t *>(fbs[current].active_tiles.data()),
+              static_cast<const uint32_t *>(active_tiles_buf.data()),
           .active_cursor = active_cursor,
           .color = args.color,
           .depth = args.depth,
@@ -1062,9 +1050,10 @@ int main(int argc, char **argv) {
       }
     } else {
       uint32_t epoch = frame + 1;
+      persistent_args_device->color = args.color;
+      kfd::detail::memory_barrier();
       __atomic_store_n(&control->active_cursor, 0u, __ATOMIC_RELEASE);
       __atomic_store_n(&control->render_done, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->active_slot, current, __ATOMIC_RELEASE);
       __atomic_store_n(&control->active_count, tile_count, __ATOMIC_RELEASE);
       __atomic_store_n(&control->current_epoch, epoch, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
