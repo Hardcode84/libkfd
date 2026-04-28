@@ -513,13 +513,6 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
 
     for (;;) {
       if (tid == 0)
-        lds_terminate =
-            __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
-      __gpu_sync_threads();
-      if (lds_terminate != 0)
-        return;
-
-      if (tid == 0)
         lds_claimed_tile = pop_active_tile(&args.control->active_cursor,
                                            f.active_tiles, active_count);
       __gpu_sync_threads();
@@ -527,14 +520,10 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       if (tile == 0xffffffffu) {
         for (;;) {
           if (tid == 0) {
-            lds_terminate =
-                __atomic_load_n(&args.control->terminate, __ATOMIC_ACQUIRE);
             lds_frame_closed =
                 try_complete_epoch(args.control, epoch, active_count);
           }
           __gpu_sync_threads();
-          if (lds_terminate != 0)
-            return;
           if (lds_frame_closed)
             break;
           __builtin_amdgcn_s_sleep(4);
