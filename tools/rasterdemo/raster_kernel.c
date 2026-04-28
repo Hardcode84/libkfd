@@ -1,38 +1,6 @@
 #include <gpuintrin.h>
 
-struct DemoVertex {
-  float x;
-  float y;
-  float z;
-  float u;
-  float v;
-};
-
-struct DemoPrimitive {
-  struct DemoVertex v0;
-  struct DemoVertex v1;
-  struct DemoVertex v2;
-};
-
-struct TileRange {
-  unsigned offset;
-  unsigned count;
-};
-
-struct RasterArgs {
-  const struct DemoPrimitive *prims;
-  const unsigned *tile_indices;
-  const struct TileRange *tile_ranges;
-  unsigned *color;
-  float *depth;
-  unsigned width;
-  unsigned height;
-  unsigned pitch;
-  unsigned tile_size;
-  unsigned tiles_x;
-  unsigned clear_color;
-  float clear_depth;
-};
+#include "raster_common.h"
 
 struct PersistentFrame {
   const struct DemoPrimitive *prims;
@@ -50,77 +18,6 @@ struct PersistentFrame {
   unsigned clear_color;
   float clear_depth;
   unsigned clear_only;
-};
-
-struct ClaimFrameArgs {
-  const struct DemoPrimitive *prims;
-  const unsigned *tile_indices;
-  const struct TileRange *tile_ranges;
-  const volatile unsigned *active_tiles;
-  volatile unsigned *active_cursor;
-  unsigned *color;
-  float *depth;
-  unsigned width;
-  unsigned height;
-  unsigned pitch;
-  unsigned tile_size;
-  unsigned tiles_x;
-  unsigned tiles_y;
-  unsigned clear_color;
-  float clear_depth;
-  unsigned clear_only;
-  unsigned active_count;
-};
-
-struct PersistentControl {
-  volatile unsigned terminate;
-  volatile unsigned current_epoch;
-  volatile unsigned sealed_epoch;
-  volatile unsigned closing_epoch;
-  volatile unsigned completed_epoch;
-  volatile unsigned active_cursor;
-  volatile unsigned active_count;
-  volatile unsigned render_done;
-};
-
-struct PersistentArgs {
-  struct PersistentControl *control;
-  const struct DemoPrimitive *prims;
-  const unsigned *tile_indices;
-  const struct TileRange *tile_ranges;
-  const volatile unsigned *active_tiles;
-  unsigned *color;
-  float *depth;
-  unsigned width;
-  unsigned height;
-  unsigned pitch;
-  unsigned tile_size;
-  unsigned tiles_x;
-  unsigned tiles_y;
-  unsigned clear_color;
-  float clear_depth;
-  unsigned clear_only;
-};
-
-struct PersistentLaunchArgs {
-  const struct PersistentArgs *args;
-};
-
-struct ProbeArgs {
-  unsigned *out;
-};
-
-enum {
-  RASTER_TILE_SIZE = 32u,
-  SUBTILE_WIDTH = 16u,
-  SUBTILE_HEIGHT = 4u,
-  SUBTILES_X = RASTER_TILE_SIZE / SUBTILE_WIDTH,
-  SUBTILES_Y = RASTER_TILE_SIZE / SUBTILE_HEIGHT,
-  NUM_SUBTILES = SUBTILES_X * SUBTILES_Y,
-  SUBTILE_PIXELS = SUBTILE_WIDTH * SUBTILE_HEIGHT,
-  PERSISTENT_WAVE_COUNT = 4u,
-  SUBTILE_PASSES_PER_WAVE =
-      (NUM_SUBTILES + PERSISTENT_WAVE_COUNT - 1u) / PERSISTENT_WAVE_COUNT,
 };
 
 [[clang::loader_uninitialized]]

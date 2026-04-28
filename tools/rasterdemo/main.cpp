@@ -8,6 +8,8 @@
 
 #include "window.h"
 
+#include "raster_common.h"
+
 #include "libkfd/detail/elf.h"
 #include "libkfd/libkfd.h"
 
@@ -30,117 +32,9 @@
 
 namespace {
 
-constexpr uint32_t NUM_BUFFERS = 3;
-constexpr uint32_t TILE_SIZE = 32;
-constexpr uint32_t BLOCK_X = 16;
-constexpr uint32_t BLOCK_Y = 16;
-constexpr uint32_t CLAIM_BLOCK_X = 32;
-constexpr uint32_t CLAIM_BLOCK_Y = 1;
-constexpr uint32_t PERSISTENT_BLOCK_X = 16;
-constexpr uint32_t PERSISTENT_BLOCK_Y = 8;
-constexpr uint32_t DEFAULT_PERSISTENT_WGS = 48;
-constexpr uint32_t STRIDE_ALIGN = 256;
-constexpr uint32_t CLEAR_COLOR = 0xff102030u;
-constexpr float CLEAR_DEPTH = 1.0f;
-constexpr uint32_t SLICES = 64;
-constexpr uint32_t RINGS = 48;
-constexpr float PI = 3.14159265358979323846f;
-constexpr float TAU = 6.28318530717958647692f;
 constexpr kfd::MemFlags HOST_GTT_FLAGS =
     kfd::MemFlags::WRITABLE | kfd::MemFlags::EXECUTABLE |
     kfd::MemFlags::HOST_ACCESS | kfd::MemFlags::UNCACHED;
-
-struct DemoVertex {
-  float x;
-  float y;
-  float z;
-  float u;
-  float v;
-};
-
-struct DemoPrimitive {
-  DemoVertex v0;
-  DemoVertex v1;
-  DemoVertex v2;
-};
-
-struct TileRange {
-  uint32_t offset;
-  uint32_t count;
-};
-
-struct RasterArgs {
-  const DemoPrimitive *prims;
-  const uint32_t *tile_indices;
-  const TileRange *tile_ranges;
-  uint32_t *color;
-  float *depth;
-  uint32_t width;
-  uint32_t height;
-  uint32_t pitch;
-  uint32_t tile_size;
-  uint32_t tiles_x;
-  uint32_t clear_color;
-  float clear_depth;
-};
-
-struct PersistentControl {
-  uint32_t terminate;
-  uint32_t current_epoch;
-  uint32_t sealed_epoch;
-  uint32_t closing_epoch;
-  uint32_t completed_epoch;
-  uint32_t active_cursor;
-  uint32_t active_count;
-  uint32_t render_done;
-};
-
-struct ClaimFrameArgs {
-  const DemoPrimitive *prims;
-  const uint32_t *tile_indices;
-  const TileRange *tile_ranges;
-  const uint32_t *active_tiles;
-  uint32_t *active_cursor;
-  uint32_t *color;
-  float *depth;
-  uint32_t width;
-  uint32_t height;
-  uint32_t pitch;
-  uint32_t tile_size;
-  uint32_t tiles_x;
-  uint32_t tiles_y;
-  uint32_t clear_color;
-  float clear_depth;
-  uint32_t clear_only;
-  uint32_t active_count;
-};
-
-struct PersistentArgs {
-  PersistentControl *control;
-  const DemoPrimitive *prims;
-  const uint32_t *tile_indices;
-  const TileRange *tile_ranges;
-  const uint32_t *active_tiles;
-  uint32_t *color;
-  float *depth;
-  uint32_t width;
-  uint32_t height;
-  uint32_t pitch;
-  uint32_t tile_size;
-  uint32_t tiles_x;
-  uint32_t tiles_y;
-  uint32_t clear_color;
-  float clear_depth;
-  uint32_t clear_only;
-};
-
-struct PersistentLaunchArgs {
-  const PersistentArgs *args;
-};
-
-struct ProbeArgs {
-  uint32_t *out;
-};
 
 struct DemoBinary {
   const char *path;
