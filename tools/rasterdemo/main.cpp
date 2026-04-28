@@ -980,8 +980,7 @@ int main(int argc, char **argv) {
               stderr,
               "error: frame %u persistent GPU wait timed out "
               "(completed_wgs=%u/%u)\n",
-              frame,
-              __atomic_load_n(&control->completed_wgs, __ATOMIC_ACQUIRE),
+              frame, __atomic_load_n(&control->completed_wgs, __ATOMIC_ACQUIRE),
               persistent_wgs);
           __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
           KFD_EXPECT(compute.signal(shutdown_signal));

@@ -1,8 +1,6 @@
 #ifndef RASTERDEMO_RASTER_COMMON_H
 #define RASTERDEMO_RASTER_COMMON_H
 
-typedef unsigned RasterU32;
-
 enum {
   NUM_BUFFERS = 3u,
   TILE_SIZE = 32u,
@@ -47,69 +45,69 @@ typedef struct DemoPrimitive {
 } DemoPrimitive;
 
 typedef struct TileRange {
-  RasterU32 offset;
-  RasterU32 count;
+  unsigned offset;
+  unsigned count;
 } TileRange;
 
 typedef struct RasterArgs {
   const DemoPrimitive *prims;
-  const RasterU32 *tile_indices;
+  const unsigned *tile_indices;
   const TileRange *tile_ranges;
-  RasterU32 *color;
+  unsigned *color;
   float *depth;
-  RasterU32 width;
-  RasterU32 height;
-  RasterU32 pitch;
-  RasterU32 tile_size;
-  RasterU32 tiles_x;
-  RasterU32 clear_color;
+  unsigned width;
+  unsigned height;
+  unsigned pitch;
+  unsigned tile_size;
+  unsigned tiles_x;
+  unsigned clear_color;
   float clear_depth;
 } RasterArgs;
 
 typedef struct PersistentControl {
-  volatile RasterU32 terminate;
-  volatile RasterU32 current_epoch;
-  volatile RasterU32 active_cursor;
-  volatile RasterU32 completed_wgs;
+  volatile unsigned terminate;
+  volatile unsigned current_epoch;
+  volatile unsigned active_cursor;
+  volatile unsigned completed_wgs;
 } PersistentControl;
 
 typedef struct ClaimFrameArgs {
   const DemoPrimitive *prims;
-  const RasterU32 *tile_indices;
+  const unsigned *tile_indices;
   const TileRange *tile_ranges;
-  const volatile RasterU32 *active_tiles;
-  volatile RasterU32 *active_cursor;
-  RasterU32 *color;
+  const volatile unsigned *active_tiles;
+  volatile unsigned *active_cursor;
+  unsigned *color;
   float *depth;
-  RasterU32 width;
-  RasterU32 height;
-  RasterU32 pitch;
-  RasterU32 tile_size;
-  RasterU32 tiles_x;
-  RasterU32 tiles_y;
-  RasterU32 clear_color;
+  unsigned width;
+  unsigned height;
+  unsigned pitch;
+  unsigned tile_size;
+  unsigned tiles_x;
+  unsigned tiles_y;
+  unsigned clear_color;
   float clear_depth;
-  RasterU32 clear_only;
-  RasterU32 active_count;
+  unsigned clear_only;
+  unsigned active_count;
 } ClaimFrameArgs;
 
 typedef struct PersistentArgs {
   PersistentControl *control;
   const DemoPrimitive *prims;
-  const RasterU32 *tile_indices;
+  const unsigned *tile_indices;
   const TileRange *tile_ranges;
-  const volatile RasterU32 *active_tiles;
-  RasterU32 *color;
+  const volatile unsigned *active_tiles;
+  unsigned *color;
   float *depth;
-  RasterU32 width;
-  RasterU32 height;
-  RasterU32 pitch;
-  RasterU32 tile_size;
-  RasterU32 tiles_x;
-  RasterU32 tiles_y;
-  RasterU32 clear_color;
+  unsigned width;
+  unsigned height;
+  unsigned pitch;
+  unsigned tile_size;
+  unsigned tiles_x;
+  unsigned tiles_y;
+  unsigned clear_color;
   float clear_depth;
-  RasterU32 clear_only;
+  unsigned clear_only;
 } PersistentArgs;
 
 typedef struct PersistentLaunchArgs {
@@ -117,7 +115,7 @@ typedef struct PersistentLaunchArgs {
 } PersistentLaunchArgs;
 
 typedef struct ProbeArgs {
-  RasterU32 *out;
+  unsigned *out;
 } ProbeArgs;
 
 #endif // RASTERDEMO_RASTER_COMMON_H
