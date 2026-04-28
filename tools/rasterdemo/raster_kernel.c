@@ -400,9 +400,16 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
         __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE);
 
     for (;;) {
-      if (tid == 0)
-        lds_claimed_tile = pop_active_tile(&control->active_cursor,
-                                           f.active_tiles, active_count);
+      struct TileRange range;
+      if (tid == 0) {
+        unsigned tile = pop_active_tile(&control->active_cursor, f.active_tiles,
+                                        active_count);
+
+        if (tile != 0xffffffffu)
+          range = f.tile_ranges[tile];
+
+        lds_claimed_tile = tile;
+      }
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
       if (tile == 0xffffffffu) {
@@ -418,14 +425,13 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
         break;
       }
       if (tid == 0) {
-        struct TileRange range = f.tile_ranges[tile];
         lds_tile_range_offset = range.offset;
         lds_tile_range_count = range.count;
       }
       __gpu_sync_threads();
       unsigned tile_x = tile % f.tiles_x;
       unsigned tile_y = tile / f.tiles_x;
-      struct TileRange range = {
+      range = (struct TileRange){
           .offset = lds_tile_range_offset,
           .count = lds_tile_range_count,
       };
