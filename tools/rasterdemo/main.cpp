@@ -967,30 +967,22 @@ int main(int argc, char **argv) {
       persistent_args_device->color = args.color;
       kfd::detail::memory_barrier();
       __atomic_store_n(&control->active_cursor, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->render_done, 0u, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->active_count, tile_count, __ATOMIC_RELEASE);
-      __atomic_store_n(&control->current_epoch, epoch, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->completed_wgs, 0u, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
-      __atomic_store_n(&control->sealed_epoch, epoch, __ATOMIC_RELEASE);
+      __atomic_store_n(&control->current_epoch, epoch, __ATOMIC_RELEASE);
 
       auto deadline = std::chrono::steady_clock::now() +
                       std::chrono::nanoseconds(gpu_timeout_ns);
-      while (__atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) !=
-             epoch) {
+      while (__atomic_load_n(&control->completed_wgs, __ATOMIC_ACQUIRE) !=
+             persistent_wgs) {
         if (std::chrono::steady_clock::now() > deadline) {
           std::fprintf(
               stderr,
               "error: frame %u persistent GPU wait timed out "
-              "(current_epoch=%u sealed_epoch=%u closing_epoch=%u "
-              "completed_epoch=%u active_cursor=%u active_count=%u "
-              "render_done=%u)\n",
-              frame, __atomic_load_n(&control->current_epoch, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->sealed_epoch, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->closing_epoch, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->active_cursor, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&control->render_done, __ATOMIC_ACQUIRE));
+              "(completed_wgs=%u/%u)\n",
+              frame,
+              __atomic_load_n(&control->completed_wgs, __ATOMIC_ACQUIRE),
+              persistent_wgs);
           __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
           KFD_EXPECT(compute.signal(shutdown_signal));
           (void)shutdown_signal.wait(kfd::Condition::EQ, 0, gpu_timeout_ns);

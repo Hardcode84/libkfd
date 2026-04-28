@@ -27,8 +27,6 @@ static __gpu_local volatile unsigned lds_tile_range_offset;
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_tile_range_count;
 [[clang::loader_uninitialized]]
-static __gpu_local volatile unsigned lds_frame_closed;
-[[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_current_epoch;
 [[clang::loader_uninitialized]]
 static __gpu_local volatile unsigned lds_terminate;
@@ -50,25 +48,6 @@ static unsigned pop_active_tile(volatile unsigned *cursor,
   if (index >= active_count)
     return 0xffffffffu;
   return __atomic_load_n(&active_tiles[index], __ATOMIC_ACQUIRE);
-}
-
-static unsigned try_complete_epoch(struct PersistentControl *control,
-                                   unsigned epoch, unsigned active_count) {
-  unsigned sealed = __atomic_load_n(&control->sealed_epoch, __ATOMIC_ACQUIRE);
-  unsigned cursor = __atomic_load_n(&control->active_cursor, __ATOMIC_ACQUIRE);
-  unsigned done = __atomic_load_n(&control->render_done, __ATOMIC_ACQUIRE);
-  if (sealed < epoch || cursor < active_count || done < active_count)
-    return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >=
-           epoch;
-
-  unsigned expected = epoch - 1u;
-  if (__atomic_compare_exchange_n(&control->closing_epoch, &expected, epoch,
-                                  false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-    __atomic_store_n(&control->completed_epoch, epoch, __ATOMIC_RELEASE);
-    return 1u;
-  }
-
-  return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >= epoch;
 }
 
 __gpu_kernel void rasterdemo_probe(struct ProbeArgs args) {
@@ -396,8 +375,7 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     f.clear_color = args.clear_color;
     f.clear_depth = args.clear_depth;
     f.clear_only = args.clear_only;
-    unsigned active_count =
-        __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE);
+    unsigned active_count = f.tiles_x * f.tiles_y;
 
     for (;;) {
       struct TileRange range;
@@ -412,18 +390,9 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       }
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
-      if (tile == 0xffffffffu) {
-        for (;;) {
-          if (tid == 0) {
-            lds_frame_closed = try_complete_epoch(control, epoch, active_count);
-          }
-          __gpu_sync_threads();
-          if (lds_frame_closed)
-            break;
-          __builtin_amdgcn_s_sleep(4);
-        }
+      if (tile == 0xffffffffu)
         break;
-      }
+
       if (tid == 0) {
         lds_tile_range_offset = range.offset;
         lds_tile_range_count = range.count;
@@ -440,16 +409,10 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                             f.clear_color, f.clear_depth, tile_x, tile_y,
                             f.clear_only, tid);
       __gpu_sync_threads();
-
-      if (tid == 0) {
-        __atomic_fetch_add(&control->render_done, 1u, __ATOMIC_ACQ_REL);
-        lds_frame_closed = try_complete_epoch(control, epoch, active_count);
-      }
-      __gpu_sync_threads();
-      if (lds_frame_closed)
-        break;
     }
 
+    if (tid == 0)
+      __atomic_fetch_add(&control->completed_wgs, 1u, __ATOMIC_ACQ_REL);
     seen_epoch = epoch;
   }
 }

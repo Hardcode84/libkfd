@@ -69,12 +69,8 @@ typedef struct RasterArgs {
 typedef struct PersistentControl {
   volatile RasterU32 terminate;
   volatile RasterU32 current_epoch;
-  volatile RasterU32 sealed_epoch;
-  volatile RasterU32 closing_epoch;
-  volatile RasterU32 completed_epoch;
   volatile RasterU32 active_cursor;
-  volatile RasterU32 active_count;
-  volatile RasterU32 render_done;
+  volatile RasterU32 completed_wgs;
 } PersistentControl;
 
 typedef struct ClaimFrameArgs {
