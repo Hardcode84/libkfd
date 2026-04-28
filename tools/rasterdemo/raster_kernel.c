@@ -45,7 +45,7 @@ static unsigned pop_active_tile(unsigned *cursor, const unsigned *active_tiles,
                                 unsigned active_count) {
   unsigned index = __atomic_fetch_add(cursor, 1u, __ATOMIC_ACQ_REL);
   if (index >= active_count)
-    return 0xffffffffu;
+    return NO_TILE;
   return __atomic_load_n(&active_tiles[index], __ATOMIC_ACQUIRE);
 }
 
@@ -306,7 +306,7 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
                                          args.active_count);
     __gpu_sync_threads();
     unsigned tile = lds_claimed_tile;
-    if (tile == 0xffffffffu)
+    if (tile == NO_TILE)
       break;
 
     if (tid == 0) {
@@ -382,14 +382,14 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
         unsigned tile = pop_active_tile(&control->active_cursor, f.active_tiles,
                                         active_count);
 
-        if (tile != 0xffffffffu)
+        if (tile != NO_TILE)
           range = f.tile_ranges[tile];
 
         lds_claimed_tile = tile;
       }
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
-      if (tile == 0xffffffffu)
+      if (tile == NO_TILE)
         break;
 
       if (tid == 0) {
