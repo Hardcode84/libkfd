@@ -352,12 +352,11 @@ TEST_CASE("Streaming raster demo - persistent mode completes frames and exits",
         *fix.gpu, kfd::detail::align_up(MAX_PRIMS * sizeof(DemoPrimitive),
                                         kfd::detail::page_size()));
     auto color = kfd::test::alloc_host_buffer(
-        *fix.gpu,
-        kfd::detail::align_up(PIXELS * sizeof(uint32_t),
-                              kfd::detail::page_size()));
+        *fix.gpu, kfd::detail::align_up(PIXELS * sizeof(uint32_t),
+                                        kfd::detail::page_size()));
     auto depth = kfd::test::alloc_host_buffer(
-        *fix.gpu,
-        kfd::detail::align_up(PIXELS * sizeof(float), kfd::detail::page_size()));
+        *fix.gpu, kfd::detail::align_up(PIXELS * sizeof(float),
+                                        kfd::detail::page_size()));
     auto control_buf = kfd::test::alloc_host_buffer(
         *fix.gpu, kfd::detail::align_up(sizeof(PersistentControl),
                                         kfd::detail::page_size()));
@@ -438,6 +437,7 @@ TEST_CASE("Streaming raster demo - persistent mode completes frames and exits",
     auto sig = kfd::Signal::create(fix.gpu->context());
     REQUIRE_RESULT(sig);
     REQUIRE_RESULT(fix.compute.signal(*sig));
-    REQUIRE_RESULT(sig->wait(kfd::Condition::EQ, 0, kfd::test::WAIT_TIMEOUT_NS));
+    REQUIRE_RESULT(
+        sig->wait(kfd::Condition::EQ, 0, kfd::test::WAIT_TIMEOUT_NS));
   });
 }

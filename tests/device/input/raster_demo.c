@@ -148,8 +148,8 @@ static void raster_tile(const struct DemoPrimitive *prims, unsigned prim_count,
       for (unsigned j = 0; j < count; ++j) {
         unsigned i = overflow ? j : lds_prim_indices[j];
         struct DemoPrimitive tri = prims[i];
-        float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
-                          tri.v2.y);
+        float area =
+            edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y);
         if (area > -0.00001f && area < 0.00001f)
           continue;
 
@@ -208,9 +208,9 @@ __gpu_kernel void headless_stage1_persistent(struct PersistentRasterArgs args) {
       if (__gpu_thread_id_x() == 0 && __gpu_thread_id_y() == 0 &&
           __gpu_thread_id_z() == 0) {
         __atomic_fetch_add(&args.control->heartbeat, 1u, __ATOMIC_RELAXED);
-        unsigned done =
-            __atomic_fetch_add(&args.control->tiles_done, 1u, __ATOMIC_ACQ_REL) +
-            1u;
+        unsigned done = __atomic_fetch_add(&args.control->tiles_done, 1u,
+                                           __ATOMIC_ACQ_REL) +
+                        1u;
         if (done == tile_count) {
           __atomic_store_n(&args.control->rendered, prim_count,
                            __ATOMIC_RELEASE);

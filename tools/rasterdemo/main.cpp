@@ -358,8 +358,8 @@ std::vector<std::byte> read_file(const char *path) {
 
 void parse_resolution(const char *str, uint32_t &w, uint32_t &h) {
   if (std::sscanf(str, "%ux%u", &w, &h) != 2) {
-    std::fprintf(stderr, "error: invalid resolution '%s', expected WIDTHxHEIGHT\n",
-                 str);
+    std::fprintf(
+        stderr, "error: invalid resolution '%s', expected WIDTHxHEIGHT\n", str);
     std::exit(1);
   }
 }
@@ -599,15 +599,13 @@ int main(int argc, char **argv) {
       continue;
     }
     if (arg.starts_with("--gpu-timeout-ms=")) {
-      gpu_timeout_ms =
-          parse_u32(arg.substr(std::strlen("--gpu-timeout-ms=")),
-                    "gpu-timeout-ms");
+      gpu_timeout_ms = parse_u32(arg.substr(std::strlen("--gpu-timeout-ms=")),
+                                 "gpu-timeout-ms");
       continue;
     }
     if (arg.starts_with("--persistent-wgs=")) {
-      requested_persistent_wgs =
-          parse_u32(arg.substr(std::strlen("--persistent-wgs=")),
-                    "persistent-wgs");
+      requested_persistent_wgs = parse_u32(
+          arg.substr(std::strlen("--persistent-wgs=")), "persistent-wgs");
       continue;
     }
     if (arg == "--xcb-sw") {
@@ -689,8 +687,8 @@ int main(int argc, char **argv) {
   auto compute = KFD_EXPECT(kfd::ComputeQueue::create(dev));
   auto kernel_file = read_file(bin->path);
   auto exe = KFD_EXPECT(kfd::Executable::load(dev, kernel_file, compute));
-  auto frame_kernel = KFD_EXPECT(
-      exe.kernel(clear_only ? "rasterdemo_clear_frame.kd" : "rasterdemo_frame.kd"));
+  auto frame_kernel = KFD_EXPECT(exe.kernel(
+      clear_only ? "rasterdemo_clear_frame.kd" : "rasterdemo_frame.kd"));
   auto claim_frame_kernel = KFD_EXPECT(exe.kernel("rasterdemo_claim_frame.kd"));
   auto persistent_kernel = KFD_EXPECT(exe.kernel("rasterdemo_persistent.kd"));
 
@@ -707,9 +705,8 @@ int main(int argc, char **argv) {
     probe.fill(kernarg, args, probe_cfg);
     auto sig = KFD_EXPECT(kfd::Signal::create(ctx));
     KFD_EXPECT(compute.dispatch(probe, probe_cfg, kernarg, sig));
-    auto waited =
-        sig.wait(kfd::Condition::EQ, 0,
-                 static_cast<uint64_t>(gpu_timeout_ms) * 1'000'000u);
+    auto waited = sig.wait(kfd::Condition::EQ, 0,
+                           static_cast<uint64_t>(gpu_timeout_ms) * 1'000'000u);
     if (!waited) {
       std::fprintf(stderr, "error: probe GPU wait failed: %s\n",
                    kfd::strerror(waited));
@@ -738,7 +735,7 @@ int main(int argc, char **argv) {
     std::printf("Presentation: headless\n");
   } else
 #ifdef HAVE_RASTERDEMO_XCB_SW
-  if (force_software_present) {
+      if (force_software_present) {
     auto sw = XcbSoftwareWindow::create(width, height, "libkfd rasterdemo");
     if (!sw) {
       std::fprintf(stderr, "error: %s\n", kfd::strerror(sw));
@@ -751,7 +748,7 @@ int main(int argc, char **argv) {
     std::printf("Presentation: XCB software (xcb_put_image)\n");
   } else
 #else
-  if (force_software_present) {
+      if (force_software_present) {
     std::fprintf(stderr, "error: rasterdemo was built without XCB software "
                          "presentation support\n");
     return 1;
@@ -769,19 +766,19 @@ int main(int argc, char **argv) {
     } else {
 #ifdef HAVE_RASTERDEMO_XCB_SW
       if (backend != WindowBackend::Drm && std::getenv("DISPLAY")) {
-      std::fprintf(stderr,
-                   "warning: dma-buf presentation unavailable (%s); falling "
-                   "back to XCB software presentation\n",
-                   kfd::strerror(display));
-      auto sw = XcbSoftwareWindow::create(width, height, "libkfd rasterdemo");
-      if (!sw) {
-        std::fprintf(stderr, "error: %s\n", kfd::strerror(sw));
-        return 1;
-      }
-      sw_win = std::make_unique<XcbSoftwareWindow>(std::move(*sw));
-      software_present = true;
-      width = sw_win->width();
-      height = sw_win->height();
+        std::fprintf(stderr,
+                     "warning: dma-buf presentation unavailable (%s); falling "
+                     "back to XCB software presentation\n",
+                     kfd::strerror(display));
+        auto sw = XcbSoftwareWindow::create(width, height, "libkfd rasterdemo");
+        if (!sw) {
+          std::fprintf(stderr, "error: %s\n", kfd::strerror(sw));
+          return 1;
+        }
+        sw_win = std::make_unique<XcbSoftwareWindow>(std::move(*sw));
+        software_present = true;
+        width = sw_win->width();
+        height = sw_win->height();
       } else
 #endif
       {
@@ -807,7 +804,8 @@ int main(int argc, char **argv) {
   uint32_t persistent_wgs = requested_persistent_wgs ? requested_persistent_wgs
                                                      : default_persistent_wgs;
   if (persistent_wgs == 0) {
-    std::fprintf(stderr, "error: persistent workgroup count must be non-zero\n");
+    std::fprintf(stderr,
+                 "error: persistent workgroup count must be non-zero\n");
     return 1;
   }
 
@@ -820,8 +818,8 @@ int main(int argc, char **argv) {
   size_t prim_bytes = RINGS * SLICES * 2 * sizeof(DemoPrimitive);
   size_t max_tile_indices = RINGS * SLICES * 2 * 256;
   size_t tile_indices_bytes = max_tile_indices * sizeof(uint32_t);
-  size_t tile_ranges_bytes = static_cast<size_t>(tiles_x) * tiles_y *
-                             sizeof(TileRange);
+  size_t tile_ranges_bytes =
+      static_cast<size_t>(tiles_x) * tiles_y * sizeof(TileRange);
   size_t active_tiles_bytes =
       static_cast<size_t>(tiles_x) * tiles_y * sizeof(uint32_t);
   auto prim_buf = KFD_EXPECT(kfd::Buffer::allocate(
@@ -847,13 +845,15 @@ int main(int argc, char **argv) {
   for (uint32_t i = 0; i < NUM_BUFFERS; ++i) {
     kfd::MemType color_type =
         (software_present || headless) ? kfd::MemType::GTT : kfd::MemType::VRAM;
-    kfd::MemFlags color_flags =
-        (software_present || headless) ? HOST_GTT_FLAGS : kfd::MemFlags::WRITABLE;
-    fbs[i].color = KFD_EXPECT(kfd::Buffer::allocate(
-        dev, color_bytes, color_type, color_flags));
+    kfd::MemFlags color_flags = (software_present || headless)
+                                    ? HOST_GTT_FLAGS
+                                    : kfd::MemFlags::WRITABLE;
+    fbs[i].color = KFD_EXPECT(
+        kfd::Buffer::allocate(dev, color_bytes, color_type, color_flags));
     KFD_EXPECT(fbs[i].color.map(dev));
     fbs[i].active_tiles = KFD_EXPECT(kfd::Buffer::allocate(
-        dev, kfd::detail::align_up(active_tiles_bytes, kfd::detail::page_size()),
+        dev,
+        kfd::detail::align_up(active_tiles_bytes, kfd::detail::page_size()),
         kfd::MemType::GTT, HOST_GTT_FLAGS));
     KFD_EXPECT(fbs[i].active_tiles.map(dev));
     auto *active_tiles = static_cast<uint32_t *>(fbs[i].active_tiles.data());
@@ -876,10 +876,11 @@ int main(int argc, char **argv) {
   }
   kfd::detail::memory_barrier();
 
-  auto control_buf = KFD_EXPECT(kfd::Buffer::allocate(
-      dev, kfd::detail::align_up(sizeof(PersistentControl),
-                                 kfd::detail::page_size()),
-      kfd::MemType::GTT, HOST_GTT_FLAGS));
+  auto control_buf = KFD_EXPECT(
+      kfd::Buffer::allocate(dev,
+                            kfd::detail::align_up(sizeof(PersistentControl),
+                                                  kfd::detail::page_size()),
+                            kfd::MemType::GTT, HOST_GTT_FLAGS));
   KFD_EXPECT(control_buf.map(dev));
 
   auto *control = static_cast<PersistentControl *>(control_buf.data());
@@ -899,9 +900,12 @@ int main(int argc, char **argv) {
       .prims = static_cast<const DemoPrimitive *>(prim_buf.data()),
       .tile_indices = static_cast<const uint32_t *>(tile_indices_buf.data()),
       .tile_ranges = static_cast<const TileRange *>(tile_ranges_buf.data()),
-      .active_tiles0 = static_cast<const uint32_t *>(fbs[0].active_tiles.data()),
-      .active_tiles1 = static_cast<const uint32_t *>(fbs[1].active_tiles.data()),
-      .active_tiles2 = static_cast<const uint32_t *>(fbs[2].active_tiles.data()),
+      .active_tiles0 =
+          static_cast<const uint32_t *>(fbs[0].active_tiles.data()),
+      .active_tiles1 =
+          static_cast<const uint32_t *>(fbs[1].active_tiles.data()),
+      .active_tiles2 =
+          static_cast<const uint32_t *>(fbs[2].active_tiles.data()),
       .color0 = static_cast<uint32_t *>(fbs[0].color.data()),
       .color1 = static_cast<uint32_t *>(fbs[1].color.data()),
       .color2 = static_cast<uint32_t *>(fbs[2].color.data()),
@@ -917,8 +921,8 @@ int main(int argc, char **argv) {
       .clear_only = clear_only ? 1u : 0u,
   };
   auto persistent_args_buf = KFD_EXPECT(kfd::Buffer::allocate(
-      dev, kfd::detail::align_up(sizeof(PersistentArgs),
-                                 kfd::detail::page_size()),
+      dev,
+      kfd::detail::align_up(sizeof(PersistentArgs), kfd::detail::page_size()),
       kfd::MemType::GTT, HOST_GTT_FLAGS));
   KFD_EXPECT(persistent_args_buf.map(dev));
   std::memcpy(persistent_args_buf.data(), &persistent_args,
@@ -935,9 +939,10 @@ int main(int argc, char **argv) {
     std::printf("Kernel mode: persistent (%u workgroups, %ux%u threads)\n",
                 persistent_wgs, PERSISTENT_BLOCK_X, PERSISTENT_BLOCK_Y);
   } else if (kernel_mode == KernelMode::PerFrame) {
-    std::printf("Kernel mode: per-frame active tile queue (%u workgroups, %ux%u "
-                "threads)\n",
-                persistent_wgs, CLAIM_BLOCK_X, CLAIM_BLOCK_Y);
+    std::printf(
+        "Kernel mode: per-frame active tile queue (%u workgroups, %ux%u "
+        "threads)\n",
+        persistent_wgs, CLAIM_BLOCK_X, CLAIM_BLOCK_Y);
   } else {
     std::printf("Kernel mode: static grid dispatch per frame\n");
   }
@@ -953,15 +958,14 @@ int main(int argc, char **argv) {
   uint64_t gpu_timeout_ns = static_cast<uint64_t>(gpu_timeout_ms) * 1'000'000u;
 
   for (;;) {
-    bool running =
-        headless ? true :
-        software_present
+    bool running = headless ? true
+                   : software_present
 #ifdef HAVE_RASTERDEMO_XCB_SW
-            ? sw_win->poll()
+                       ? sw_win->poll()
 #else
-            ? false
+                       ? false
 #endif
-            : win->poll();
+                       : win->poll();
     if (!running)
       break;
 
@@ -1071,30 +1075,22 @@ int main(int argc, char **argv) {
       while (__atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) !=
              epoch) {
         if (std::chrono::steady_clock::now() > deadline) {
-          std::fprintf(stderr,
-                       "error: frame %u persistent GPU wait timed out "
-                       "(current_epoch=%u sealed_epoch=%u closing_epoch=%u "
-                       "completed_epoch=%u active_cursor=%u active_count=%u "
-                       "render_done=%u)\n",
-                       frame,
-                       __atomic_load_n(&control->current_epoch,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->sealed_epoch,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->closing_epoch,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->completed_epoch,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->active_cursor,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->active_count,
-                                       __ATOMIC_ACQUIRE),
-                       __atomic_load_n(&control->render_done,
-                                       __ATOMIC_ACQUIRE));
+          std::fprintf(
+              stderr,
+              "error: frame %u persistent GPU wait timed out "
+              "(current_epoch=%u sealed_epoch=%u closing_epoch=%u "
+              "completed_epoch=%u active_cursor=%u active_count=%u "
+              "render_done=%u)\n",
+              frame, __atomic_load_n(&control->current_epoch, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->sealed_epoch, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->closing_epoch, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->active_cursor, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->active_count, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&control->render_done, __ATOMIC_ACQUIRE));
           __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
           KFD_EXPECT(compute.signal(shutdown_signal));
-          (void)shutdown_signal.wait(kfd::Condition::EQ, 0,
-                                     gpu_timeout_ns);
+          (void)shutdown_signal.wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
           return 1;
         }
         kfd::detail::spin_hint();
@@ -1130,8 +1126,7 @@ int main(int argc, char **argv) {
   if (kernel_mode == KernelMode::Persistent) {
     __atomic_store_n(&control->terminate, 1u, __ATOMIC_RELEASE);
     KFD_EXPECT(compute.signal(shutdown_signal));
-    auto stopped =
-        shutdown_signal.wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
+    auto stopped = shutdown_signal.wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
     if (!stopped) {
       std::fprintf(stderr, "error: persistent kernel shutdown timed out: %s\n",
                    kfd::strerror(stopped));

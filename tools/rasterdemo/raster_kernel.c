@@ -166,12 +166,12 @@ static unsigned try_complete_epoch(struct PersistentControl *control,
   unsigned cursor = __atomic_load_n(&control->active_cursor, __ATOMIC_ACQUIRE);
   unsigned done = __atomic_load_n(&control->render_done, __ATOMIC_ACQUIRE);
   if (sealed < epoch || cursor < active_count || done < active_count)
-    return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >= epoch;
+    return __atomic_load_n(&control->completed_epoch, __ATOMIC_ACQUIRE) >=
+           epoch;
 
   unsigned expected = epoch - 1u;
   if (__atomic_compare_exchange_n(&control->closing_epoch, &expected, epoch,
-                                  false, __ATOMIC_ACQ_REL,
-                                  __ATOMIC_ACQUIRE)) {
+                                  false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
     __atomic_store_n(&control->completed_epoch, epoch, __ATOMIC_RELEASE);
     return 1u;
   }
@@ -186,8 +186,8 @@ __gpu_kernel void rasterdemo_probe(struct ProbeArgs args) {
 
 static void clear_tile(unsigned *color, float *depth, unsigned width,
                        unsigned height, unsigned pitch, unsigned tile_size,
-                       unsigned clear_color, float clear_depth,
-                       unsigned tile_x, unsigned tile_y) {
+                       unsigned clear_color, float clear_depth, unsigned tile_x,
+                       unsigned tile_y) {
   unsigned lx = __gpu_thread_id_x();
   unsigned ly = __gpu_thread_id_y();
   unsigned tx = __gpu_num_threads_x();
@@ -211,10 +211,9 @@ static void clear_tile(unsigned *color, float *depth, unsigned width,
 }
 
 static void raster_tile(const struct DemoPrimitive *prims,
-                        const unsigned *tile_indices,
-                        struct TileRange range, unsigned *color, float *depth,
-                        unsigned width, unsigned height, unsigned pitch,
-                        unsigned tile_size,
+                        const unsigned *tile_indices, struct TileRange range,
+                        unsigned *color, float *depth, unsigned width,
+                        unsigned height, unsigned pitch, unsigned tile_size,
                         unsigned clear_color, float clear_depth,
                         unsigned tile_x, unsigned tile_y) {
   unsigned lx = __gpu_thread_id_x();
@@ -243,8 +242,8 @@ static void raster_tile(const struct DemoPrimitive *prims,
       for (unsigned j = 0; j < range.count; ++j) {
         unsigned i = tile_indices[range.offset + j];
         struct DemoPrimitive tri = prims[i];
-        float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
-                          tri.v2.y);
+        float area =
+            edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y);
         if (area > -0.00001f && area < 0.00001f)
           continue;
 
@@ -293,10 +292,9 @@ static void clear_subtile(unsigned *color, float *depth, unsigned width,
 }
 
 static void raster_subtile(const struct DemoPrimitive *prims,
-                           const unsigned *tile_indices,
-                           struct TileRange range, unsigned *color,
-                           float *depth, unsigned width, unsigned height,
-                           unsigned pitch, unsigned tile_size,
+                           const unsigned *tile_indices, struct TileRange range,
+                           unsigned *color, float *depth, unsigned width,
+                           unsigned height, unsigned pitch, unsigned tile_size,
                            unsigned clear_color, float clear_depth,
                            unsigned tile_x, unsigned tile_y, unsigned subtile,
                            unsigned lane) {
@@ -326,8 +324,8 @@ static void raster_subtile(const struct DemoPrimitive *prims,
   for (unsigned j = 0; j < range.count; ++j) {
     unsigned i = tile_indices[range.offset + j];
     struct DemoPrimitive tri = prims[i];
-    float area = edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x,
-                      tri.v2.y);
+    float area =
+        edge(tri.v0.x, tri.v0.y, tri.v1.x, tri.v1.y, tri.v2.x, tri.v2.y);
     if (area > -0.00001f && area < 0.00001f)
       continue;
 
@@ -383,12 +381,11 @@ static void raster_subtile(const struct DemoPrimitive *prims,
 static void process_tile_subtiled(const struct DemoPrimitive *prims,
                                   const unsigned *tile_indices,
                                   struct TileRange range, unsigned *color,
-                                  float *depth, unsigned width,
-                                  unsigned height, unsigned pitch,
-                                  unsigned tile_size, unsigned clear_color,
-                                  float clear_depth, unsigned tile_x,
-                                  unsigned tile_y, unsigned clear_only,
-                                  unsigned tid) {
+                                  float *depth, unsigned width, unsigned height,
+                                  unsigned pitch, unsigned tile_size,
+                                  unsigned clear_color, float clear_depth,
+                                  unsigned tile_x, unsigned tile_y,
+                                  unsigned clear_only, unsigned tid) {
   const unsigned lane = tid & 31u;
   const unsigned wave = tid >> 5u;
 
@@ -426,16 +423,14 @@ __gpu_kernel void rasterdemo_frame(struct RasterArgs args) {
 }
 
 __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
-  unsigned tid = __gpu_thread_id_x() +
-                 __gpu_thread_id_y() * __gpu_num_threads_x() +
-                 __gpu_thread_id_z() * __gpu_num_threads_x() *
-                     __gpu_num_threads_y();
+  unsigned tid =
+      __gpu_thread_id_x() + __gpu_thread_id_y() * __gpu_num_threads_x() +
+      __gpu_thread_id_z() * __gpu_num_threads_x() * __gpu_num_threads_y();
 
   for (;;) {
     if (tid == 0)
-      lds_claimed_tile =
-          pop_active_tile(args.active_cursor, args.active_tiles,
-                          args.active_count);
+      lds_claimed_tile = pop_active_tile(args.active_cursor, args.active_tiles,
+                                         args.active_count);
     __gpu_sync_threads();
     unsigned tile = lds_claimed_tile;
     if (tile == 0xffffffffu)
@@ -470,10 +465,9 @@ __gpu_kernel void rasterdemo_claim_frame(struct ClaimFrameArgs args) {
 __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
   struct PersistentArgs args = *launch.args;
   unsigned seen_epoch = 0;
-  unsigned tid = __gpu_thread_id_x() +
-                 __gpu_thread_id_y() * __gpu_num_threads_x() +
-                 __gpu_thread_id_z() * __gpu_num_threads_x() *
-                     __gpu_num_threads_y();
+  unsigned tid =
+      __gpu_thread_id_x() + __gpu_thread_id_y() * __gpu_num_threads_x() +
+      __gpu_thread_id_z() * __gpu_num_threads_x() * __gpu_num_threads_y();
 
   for (;;) {
     if (tid == 0) {
@@ -493,13 +487,13 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       continue;
     }
 
-    unsigned slot = __atomic_load_n(&args.control->active_slot,
-                                    __ATOMIC_ACQUIRE);
+    unsigned slot =
+        __atomic_load_n(&args.control->active_slot, __ATOMIC_ACQUIRE);
     struct PersistentFrame f;
     f.prims = args.prims;
     f.tile_indices = args.tile_indices;
     f.tile_ranges = args.tile_ranges;
-    f.active_tiles = slot == 0 ? args.active_tiles0
+    f.active_tiles = slot == 0   ? args.active_tiles0
                      : slot == 1 ? args.active_tiles1
                                  : args.active_tiles2;
     f.color = slot == 0 ? args.color0 : slot == 1 ? args.color1 : args.color2;
@@ -513,8 +507,8 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
     f.clear_color = args.clear_color;
     f.clear_depth = args.clear_depth;
     f.clear_only = args.clear_only;
-    unsigned active_count = __atomic_load_n(&args.control->active_count,
-                                            __ATOMIC_ACQUIRE);
+    unsigned active_count =
+        __atomic_load_n(&args.control->active_count, __ATOMIC_ACQUIRE);
 
     for (;;) {
       if (tid == 0)
@@ -525,9 +519,8 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
         return;
 
       if (tid == 0)
-        lds_claimed_tile =
-            pop_active_tile(&args.control->active_cursor, f.active_tiles,
-                            active_count);
+        lds_claimed_tile = pop_active_tile(&args.control->active_cursor,
+                                           f.active_tiles, active_count);
       __gpu_sync_threads();
       unsigned tile = lds_claimed_tile;
       if (tile == 0xffffffffu) {
@@ -568,7 +561,8 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
       if (__gpu_thread_id_x() == 0 && __gpu_thread_id_y() == 0 &&
           __gpu_thread_id_z() == 0) {
         __atomic_fetch_add(&args.control->render_done, 1u, __ATOMIC_ACQ_REL);
-        lds_frame_closed = try_complete_epoch(args.control, epoch, active_count);
+        lds_frame_closed =
+            try_complete_epoch(args.control, epoch, active_count);
       }
       __gpu_sync_threads();
       if (lds_frame_closed)

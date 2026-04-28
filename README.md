@@ -173,6 +173,16 @@ invoked through ctest.
 ctest -j8
 ```
 
+## Development
+
+Install the pre-commit hooks before sending changes:
+
+```sh
+export PATH="$HOME/llvm/llvm-install/bin:$PATH"
+pre-commit install
+pre-commit run --all-files
+```
+
 ## Tools
 
 The project includes some command-line tools to serve as examples. The
