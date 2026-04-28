@@ -153,10 +153,6 @@ static const DemoBinary rasterdemo_kernels[] = {
 
 struct Framebuffer {
   kfd::Buffer color;
-  kfd::Buffer active_cursor;
-  kfd::DMABuffer dmabuf;
-  kfd::Buffer kernarg;
-  kfd::Buffer claim_kernarg;
   std::unique_ptr<kfd::Signal> signal;
 };
 
@@ -854,18 +850,13 @@ int main(int argc, char **argv) {
     fbs[i].color = KFD_EXPECT(
         kfd::Buffer::allocate(dev, color_bytes, color_type, color_flags));
     KFD_EXPECT(fbs[i].color.map(dev));
-    fbs[i].active_cursor = KFD_EXPECT(kfd::Buffer::allocate(
-        dev, kfd::detail::page_size(), kfd::MemType::GTT, HOST_GTT_FLAGS));
-    KFD_EXPECT(fbs[i].active_cursor.map(dev));
-    if (!software_present && !headless)
-      fbs[i].dmabuf = KFD_EXPECT(kfd::DMABuffer::create(fbs[i].color));
-    fbs[i].kernarg = KFD_EXPECT(frame_kernel.alloc());
-    fbs[i].claim_kernarg = KFD_EXPECT(claim_frame_kernel.alloc());
     fbs[i].signal =
         std::make_unique<kfd::Signal>(KFD_EXPECT(kfd::Signal::create(ctx)));
-    if (!software_present && !headless)
-      KFD_EXPECT(win->import_buffer(i, fbs[i].dmabuf.fd(), fbs[i].color.size(),
-                                    stride));
+    if (!software_present && !headless) {
+      auto dmabuf = KFD_EXPECT(kfd::DMABuffer::create(fbs[i].color));
+      KFD_EXPECT(
+          win->import_buffer(i, dmabuf.fd(), fbs[i].color.size(), stride));
+    }
   }
   kfd::detail::memory_barrier();
 
@@ -887,6 +878,8 @@ int main(int argc, char **argv) {
       .grid = {.x = persistent_wgs},
       .block = {.x = CLAIM_BLOCK_X, .y = CLAIM_BLOCK_Y},
   };
+  auto frame_kernarg = KFD_EXPECT(frame_kernel.alloc());
+  auto claim_kernarg = KFD_EXPECT(claim_frame_kernel.alloc());
   auto persistent_kernarg = KFD_EXPECT(persistent_kernel.alloc());
   PersistentArgs persistent_args{
       .control = control,
@@ -993,10 +986,10 @@ int main(int argc, char **argv) {
     };
 
     if (kernel_mode == KernelMode::StaticGrid) {
-      frame_kernel.fill(fbs[current].kernarg, args, cfg);
+      frame_kernel.fill(frame_kernarg, args, cfg);
 
       KFD_EXPECT(fbs[current].signal->reset());
-      KFD_EXPECT(compute.dispatch(frame_kernel, cfg, fbs[current].kernarg,
+      KFD_EXPECT(compute.dispatch(frame_kernel, cfg, frame_kernarg,
                                   *fbs[current].signal));
       auto waited =
           fbs[current].signal->wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
@@ -1007,8 +1000,7 @@ int main(int argc, char **argv) {
         return 1;
       }
     } else if (kernel_mode == KernelMode::PerFrame) {
-      auto *active_cursor =
-          static_cast<uint32_t *>(fbs[current].active_cursor.data());
+      auto *active_cursor = &control->active_cursor;
       __atomic_store_n(active_cursor, 0u, __ATOMIC_RELEASE);
       kfd::detail::memory_barrier();
 
@@ -1032,12 +1024,10 @@ int main(int argc, char **argv) {
           .clear_only = clear_only ? 1u : 0u,
           .active_count = tile_count,
       };
-      claim_frame_kernel.fill(fbs[current].claim_kernarg, claim_args,
-                              claim_cfg);
+      claim_frame_kernel.fill(claim_kernarg, claim_args, claim_cfg);
 
       KFD_EXPECT(fbs[current].signal->reset());
-      KFD_EXPECT(compute.dispatch(claim_frame_kernel, claim_cfg,
-                                  fbs[current].claim_kernarg,
+      KFD_EXPECT(compute.dispatch(claim_frame_kernel, claim_cfg, claim_kernarg,
                                   *fbs[current].signal));
       auto waited =
           fbs[current].signal->wait(kfd::Condition::EQ, 0, gpu_timeout_ns);
