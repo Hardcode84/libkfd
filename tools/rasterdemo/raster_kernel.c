@@ -396,9 +396,9 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
         lds_tile_range_offset = range.offset;
         lds_tile_range_count = range.count;
       }
-      __gpu_sync_threads();
       unsigned tile_x = tile % f.tiles_x;
       unsigned tile_y = tile / f.tiles_x;
+      __gpu_sync_threads();
       range = (struct TileRange){
           .offset = lds_tile_range_offset,
           .count = lds_tile_range_count,
@@ -407,7 +407,6 @@ __gpu_kernel void rasterdemo_persistent(struct PersistentLaunchArgs launch) {
                             f.width, f.height, f.pitch, f.tile_size,
                             f.clear_color, f.clear_depth, tile_x, tile_y,
                             f.clear_only, tid);
-      __gpu_sync_threads();
     }
 
     if (tid == 0)
